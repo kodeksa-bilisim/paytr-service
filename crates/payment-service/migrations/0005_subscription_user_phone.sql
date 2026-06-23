@@ -1,0 +1,4 @@
+ALTER TABLE paytr_subscriptions
+    ADD COLUMN IF NOT EXISTS user_phone VARCHAR(20),
+    ADD COLUMN IF NOT EXISTS user_email VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS renewal_attempts INT NOT NULL DEFAULT 0;
