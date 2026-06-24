@@ -11,7 +11,7 @@ fn hmac_sha256_base64(data: &str, key: &str) -> String {
     STANDARD.encode(mac.finalize().into_bytes())
 }
 
-/// Adım 1 / Kart saklayarak ödeme / Kayıtlı kartla ödeme token'ı.
+/// Direkt API ödeme token'ı.
 ///
 /// Formül: HMAC-SHA256(
 ///   merchant_id + user_ip + merchant_oid + email + payment_amount +
@@ -38,6 +38,7 @@ pub fn generate_payment_token(
         payment_type, installment_count, currency, test_mode, non_3d,
         merchant_salt,
     );
+    tracing::debug!(hash_input = %data, "PayTR token hesaplanıyor");
     hmac_sha256_base64(&data, merchant_key)
 }
 

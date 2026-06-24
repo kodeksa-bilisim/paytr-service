@@ -108,6 +108,7 @@ pub struct PaytrFormParams {
     pub payment_amount: String,
     pub installment_count: u8,
     pub no_installment: u8,
+    pub max_installment: u8,
     pub currency: String,
     pub test_mode: u8,
     pub non_3d: u8,
@@ -118,7 +119,7 @@ pub struct PaytrFormParams {
     pub user_basket: String,
     pub merchant_ok_url: String,
     pub merchant_fail_url: String,
-    pub client_lang: String,
+    pub lang: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub utoken: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

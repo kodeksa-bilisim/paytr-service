@@ -128,6 +128,7 @@ pub async fn init_payment(
                 payment_amount: req.payment_amount,
                 installment_count: req.installment_count,
                 no_installment: 1,
+                max_installment: 0,
                 currency: req.currency,
                 test_mode: state.config.test_mode,
                 non_3d: 0,
@@ -138,7 +139,7 @@ pub async fn init_payment(
                 user_basket,
                 merchant_ok_url: req.merchant_ok_url,
                 merchant_fail_url: req.merchant_fail_url,
-                client_lang: req.client_lang,
+                lang: req.client_lang,
                 utoken: req.utoken,
                 card_type: req.card_type,
                 debug_on: req.debug_on,
@@ -224,7 +225,9 @@ pub async fn stored_card_payment(
         ("user_basket",       user_basket.as_str()),
         ("merchant_ok_url",   ok_url.as_str()),
         ("merchant_fail_url", fail_url.as_str()),
-        ("client_lang",       req.client_lang.as_str()),
+        ("lang",              req.client_lang.as_str()),
+        ("no_installment",    "1"),
+        ("max_installment",   "0"),
         ("sync_mode",         "1"),
     ];
 
