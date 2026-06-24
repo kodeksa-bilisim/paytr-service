@@ -127,6 +127,7 @@ pub async fn init_payment(
                 payment_type: req.payment_type,
                 payment_amount: req.payment_amount,
                 installment_count: req.installment_count,
+                no_installment: 1,
                 currency: req.currency,
                 test_mode: state.config.test_mode,
                 non_3d: 0,

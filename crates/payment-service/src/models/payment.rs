@@ -107,6 +107,7 @@ pub struct PaytrFormParams {
     pub payment_type: String,
     pub payment_amount: String,
     pub installment_count: u8,
+    pub no_installment: u8,
     pub currency: String,
     pub test_mode: u8,
     pub non_3d: u8,
