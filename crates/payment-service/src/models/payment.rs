@@ -65,6 +65,26 @@ pub struct StoredCardPaymentRequest {
     pub debug_on: Option<u8>,
 }
 
+/// Enterprise plan için fiyat hesaplayıcı isteği — fiyat backend'de hesaplanır.
+#[derive(Debug, Deserialize)]
+pub struct EnterpriseInitRequest {
+    pub member_id: Option<i32>,
+    pub email: String,
+    pub users: i32,
+    pub extra_links: i32,
+    pub extra_clicks: i32,
+    pub user_name: String,
+    pub user_ip: String,
+    pub merchant_oid: String,
+    pub merchant_ok_url: String,
+    pub merchant_fail_url: String,
+    #[serde(default = "default_lang")]
+    pub client_lang: String,
+    pub utoken: Option<String>,
+    pub card_type: Option<String>,
+    pub debug_on: Option<u8>,
+}
+
 fn default_payment_type() -> String { "card".to_string() }
 fn default_currency() -> String { "TL".to_string() }
 fn default_lang() -> String { "tr".to_string() }

@@ -1,5 +1,6 @@
 use chrono::NaiveDateTime;
 use serde::Serialize;
+use serde_json::Value;
 
 #[derive(Debug, sqlx::FromRow)]
 #[allow(dead_code)]
@@ -81,6 +82,7 @@ pub struct PaytrSubscription {
     pub cancelled_at: Option<NaiveDateTime>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
+    pub metadata: Option<Value>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]

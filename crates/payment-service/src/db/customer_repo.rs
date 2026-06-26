@@ -33,8 +33,9 @@ pub async fn set_subscription_active(
     paytr_subscription_id: i32,
     expires_at: NaiveDateTime,
     next_payment_date: NaiveDateTime,
+    custom_plan: Option<String>,
 ) -> Result<()> {
-    let user_type = plan_to_user_type(plan); // "Silver" veya "Gold"
+    let user_type = plan_to_user_type(plan);
     sqlx::query(
         r#"
         UPDATE customers
@@ -47,7 +48,8 @@ pub async fn set_subscription_active(
             last_payment_date     = NOW(),
             payment_method        = 'paytr',
             user_type             = $5,
-            failed_payment_attempts = 0
+            failed_payment_attempts = 0,
+            custom_plan           = $7
         WHERE member_id = $6
         "#,
     )
@@ -57,6 +59,7 @@ pub async fn set_subscription_active(
     .bind(next_payment_date)
     .bind(user_type)
     .bind(member_id)
+    .bind(custom_plan)
     .execute(pool)
     .await?;
     Ok(())

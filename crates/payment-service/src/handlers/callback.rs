@@ -149,6 +149,19 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
     }
 
     // 6. customers tablosunu güncelle
+    let custom_plan = if sub.plan == "enterprise" {
+        sub.metadata.as_ref().and_then(|m| {
+            let extra_links = m.get("extra_links")?.as_i64()?;
+            let extra_clicks = m.get("extra_clicks")?.as_i64()?;
+            Some(serde_json::json!({
+                "links_limit": 10000 + extra_links * 1000,
+                "clicks_limit": 100000 + extra_clicks * 10000,
+            }).to_string())
+        })
+    } else {
+        None
+    };
+
     customer_repo::set_subscription_active(
         &state.db,
         member_id,
@@ -156,6 +169,7 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
         subscription_id,
         expires_at,
         next_payment_date,
+        custom_plan,
     )
     .await
     .map_err(anyhow::Error::from)?;

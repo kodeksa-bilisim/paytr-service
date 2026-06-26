@@ -6,7 +6,7 @@ use crate::{
     db::{customer_repo, payment_repo, subscription_repo},
     error::AppError,
     models::payment::{
-        BasketItem, InitPaymentRequest, InitPaymentResponse, PaytrFormParams,
+        BasketItem, EnterpriseInitRequest, InitPaymentRequest, InitPaymentResponse, PaytrFormParams,
         StoredCardPaymentRequest, StoredCardPaymentResponse,
     },
     paytr_client::PAYTR_PAYMENT_ENDPOINT,
@@ -75,6 +75,7 @@ pub async fn init_payment(
         &req.currency,
         &req.user_phone,
         &req.email,
+        None,
     )
     .await
     .map_err(anyhow::Error::from)?;
@@ -304,6 +305,147 @@ struct PaytrSyncResponse {
     msg: Option<String>,
 }
 
+
+pub async fn init_enterprise_payment(
+    State(state): State<AppState>,
+    Json(req): Json<EnterpriseInitRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    validate_redirect_url(&req.merchant_ok_url, "merchant_ok_url")?;
+    validate_redirect_url(&req.merchant_fail_url, "merchant_fail_url")?;
+
+    let member_id = match req.member_id {
+        Some(id) if id > 0 => id,
+        _ => customer_repo::find_member_id_by_email(&state.db, &req.email)
+            .await
+            .map_err(anyhow::Error::from)?
+            .ok_or_else(|| AppError::BadRequest(format!("Kullanıcı bulunamadı: {}", req.email)))?,
+    };
+
+    let extra_users = (req.users - 1).max(0) as i64;
+    let total_kurus: i64 = 99900
+        + extra_users * 15000
+        + (req.extra_links as i64) * 10000
+        + (req.extra_clicks as i64) * 5000;
+    let payment_amount = total_kurus.to_string();
+
+    let basket_label = format!(
+        "Enterprise Plan ({} kullanıcı, {}k link/ay, {}k tıklama/ay)",
+        req.users,
+        10 + req.extra_links,
+        100 + req.extra_clicks * 10,
+    );
+    let price_tl = format!("{:.2}", total_kurus as f64 / 100.0);
+    let basket_items = vec![BasketItem {
+        name: basket_label,
+        price: price_tl,
+        quantity: 1,
+    }];
+    let user_basket = encode_basket(&basket_items)
+        .map_err(|e| AppError::BadRequest(format!("Sepet hatası: {}", e)))?;
+
+    let metadata = serde_json::json!({
+        "users": req.users,
+        "extra_links": req.extra_links,
+        "extra_clicks": req.extra_clicks,
+    });
+
+    subscription_repo::cancel_pending(&state.db, member_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    let subscription = subscription_repo::create(
+        &state.db,
+        member_id,
+        "enterprise",
+        "monthly",
+        &payment_amount,
+        "TL",
+        "",
+        &req.email,
+        Some(metadata),
+    )
+    .await
+    .map_err(anyhow::Error::from)?;
+
+    let installment_str = "0".to_string();
+    let test_mode_str = state.config.test_mode.to_string();
+
+    let paytr_token = generate_payment_token(
+        &state.config.merchant_id,
+        &req.user_ip,
+        &req.merchant_oid,
+        &req.email,
+        &payment_amount,
+        "card",
+        &installment_str,
+        "TL",
+        &test_mode_str,
+        "0",
+        &state.config.merchant_salt,
+        &state.config.merchant_key,
+    );
+
+    let payment = payment_repo::create(
+        &state.db,
+        payment_repo::NewPayment {
+            member_id,
+            subscription_id: Some(subscription.id),
+            merchant_oid: &req.merchant_oid,
+            amount: &payment_amount,
+            currency: "TL",
+            payment_type: "card",
+            installment_count: 0,
+            is_3d: true,
+            test_mode: state.config.test_mode == 1,
+            utoken: None,
+            ctoken: None,
+        },
+    )
+    .await
+    .map_err(anyhow::Error::from)?;
+
+    tracing::info!(
+        member_id,
+        merchant_oid = %req.merchant_oid,
+        amount = %payment_amount,
+        "Enterprise ödeme başlatıldı"
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(InitPaymentResponse {
+            payment_id: payment.id,
+            subscription_id: subscription.id,
+            paytr_endpoint: PAYTR_PAYMENT_ENDPOINT.to_string(),
+            form_params: PaytrFormParams {
+                merchant_id: state.config.merchant_id.clone(),
+                paytr_token,
+                user_ip: req.user_ip,
+                merchant_oid: req.merchant_oid,
+                email: req.email,
+                payment_type: "card".to_string(),
+                payment_amount,
+                installment_count: 0,
+                no_installment: 1,
+                max_installment: 0,
+                currency: "TL".to_string(),
+                test_mode: state.config.test_mode,
+                non_3d: 0,
+                store_card: 1,
+                user_name: req.user_name,
+                user_address: String::new(),
+                user_phone: String::new(),
+                user_basket,
+                merchant_ok_url: req.merchant_ok_url,
+                merchant_fail_url: req.merchant_fail_url,
+                lang: req.client_lang,
+                utoken: req.utoken,
+                card_type: req.card_type,
+                debug_on: req.debug_on,
+            },
+        }),
+    ))
+}
 
 /// PayTR sepet formatı: htmlEntities(JSON.stringify([["Ürün Adı", "Fiyat", Adet], ...]))
 fn encode_basket(items: &[BasketItem]) -> anyhow::Result<String> {

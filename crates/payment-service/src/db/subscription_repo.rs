@@ -43,12 +43,13 @@ pub async fn create(
     currency: &str,
     user_phone: &str,
     user_email: &str,
+    metadata: Option<serde_json::Value>,
 ) -> Result<PaytrSubscription> {
     let sub = sqlx::query_as::<_, PaytrSubscription>(
         r#"
         INSERT INTO paytr_subscriptions
-            (member_id, plan, billing_cycle, amount, currency, user_phone, user_email)
-        VALUES ($1,$2,$3,$4,$5,$6,$7)
+            (member_id, plan, billing_cycle, amount, currency, user_phone, user_email, metadata)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
         RETURNING *
         "#,
     )
@@ -59,6 +60,7 @@ pub async fn create(
     .bind(currency)
     .bind(user_phone)
     .bind(user_email)
+    .bind(metadata)
     .fetch_one(pool)
     .await?;
     Ok(sub)

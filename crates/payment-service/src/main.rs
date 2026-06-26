@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(handlers::health))
         // Ödeme başlatma
         .route("/api/v1/payments/init", post(handlers::payment::init_payment))
+        .route("/api/v1/payments/init-enterprise", post(handlers::payment::init_enterprise_payment))
         .route("/api/v1/payments/stored-card", post(handlers::payment::stored_card_payment))
         // PayTR callback
         .route("/api/v1/payments/callback", post(handlers::callback::payment_callback))
