@@ -2,7 +2,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 
 use crate::{
     crypto::generate_card_delete_token,
-    db::card_repo,
+    db::{card_repo, models::CardResponse},
     error::AppError,
     models::card::{CardDeleteRequest, CardListRequest, PaytrErrorResponse},
     paytr_client::PAYTR_CARD_DELETE_ENDPOINT,
@@ -10,13 +10,17 @@ use crate::{
 };
 
 /// DB'deki kayıtlı kartları döner (PayTR API çağrısı yapmaz).
+/// utoken response'a dahil edilmez — istemciye sızdırılmamalı.
 pub async fn list_cards(
     State(state): State<AppState>,
     Json(req): Json<CardListRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let cards = card_repo::list_by_member(&state.db, req.member_id)
+    let cards: Vec<CardResponse> = card_repo::list_by_member(&state.db, req.member_id)
         .await
-        .map_err(anyhow::Error::from)?;
+        .map_err(anyhow::Error::from)?
+        .into_iter()
+        .map(CardResponse::from)
+        .collect();
 
     Ok((StatusCode::OK, Json(cards)))
 }

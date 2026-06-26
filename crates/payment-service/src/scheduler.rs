@@ -278,10 +278,10 @@ fn build_basket(plan: &str, amount_kurus: &str) -> anyhow::Result<String> {
         "silver" => "Silver Plan Aboneliği",
         other    => other,
     };
-    let price = format!(
-        "{:.2}",
-        amount_kurus.parse::<f64>().unwrap_or(0.0) / 100.0
-    );
+    let amount_tl = amount_kurus
+        .parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("Geçersiz tutar formatı: {}", amount_kurus))?;
+    let price = format!("{:.2}", amount_tl / 100.0);
     Ok(serde_json::to_string(&vec![[
         serde_json::Value::String(label.to_string()),
         serde_json::Value::String(price),

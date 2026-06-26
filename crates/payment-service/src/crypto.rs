@@ -32,13 +32,13 @@ pub fn generate_payment_token(
     merchant_salt: &str,
     merchant_key: &str,
 ) -> String {
+    tracing::debug!(merchant_oid, "PayTR token hesaplanıyor");
     let data = format!(
         "{}{}{}{}{}{}{}{}{}{}{}",
         merchant_id, user_ip, merchant_oid, email, payment_amount,
         payment_type, installment_count, currency, test_mode, non_3d,
         merchant_salt,
     );
-    tracing::debug!(hash_input = %data, "PayTR token hesaplanıyor");
     hmac_sha256_base64(&data, merchant_key)
 }
 
@@ -57,7 +57,15 @@ pub fn verify_callback_hash(
     received_hash: &str,
 ) -> bool {
     let data = format!("{}{}{}{}", merchant_oid, merchant_salt, status, total_amount);
-    hmac_sha256_base64(&data, merchant_key) == received_hash
+    // HMAC verify_slice sabit zamanlı karşılaştırma yapar (timing saldırısını önler)
+    let decoded = match STANDARD.decode(received_hash) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let mut mac = HmacSha256::new_from_slice(merchant_key.as_bytes())
+        .expect("HMAC her uzunlukta anahtar kabul eder");
+    mac.update(data.as_bytes());
+    mac.verify_slice(&decoded).is_ok()
 }
 
 /// Kayıtlı kart listesi token'ı.

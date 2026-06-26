@@ -129,3 +129,27 @@ pub async fn deactivate_card(pool: &PgPool, ctoken: &str, member_id: i32) -> Res
     .await?;
     Ok(())
 }
+
+/// Abonelik iptali / KVKK silme: üyenin tüm aktif kartlarını ve utoken'ını
+/// deaktive eder. PayTR'a silme isteği atmadan önce çağrılmamalı; bu fonksiyon
+/// yalnızca DB tarafını temizler.
+pub async fn purge_member_cards(pool: &PgPool, member_id: i32) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE paytr_cards SET is_active = FALSE
+        WHERE utoken IN (SELECT utoken FROM paytr_user_tokens WHERE member_id = $1)
+        "#,
+    )
+    .bind(member_id)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "UPDATE paytr_user_tokens SET is_active = FALSE WHERE member_id = $1",
+    )
+    .bind(member_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}

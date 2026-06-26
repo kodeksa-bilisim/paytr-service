@@ -13,6 +13,16 @@ use crate::{
     AppState,
 };
 
+/// Redirect URL'nin güvenli olduğunu doğrular: yalnızca https:// kabul edilir.
+fn validate_redirect_url(url: &str, field: &str) -> Result<(), AppError> {
+    if !url.starts_with("https://") {
+        return Err(AppError::BadRequest(format!(
+            "{field} yalnızca https:// ile başlayan URL olabilir"
+        )));
+    }
+    Ok(())
+}
+
 /// Plan ile tutar uyumunu doğrular — frontend manipülasyonunu önler.
 fn validate_plan_amount(plan: &str, amount: &str) -> Result<(), AppError> {
     let expected = match plan {
@@ -35,6 +45,8 @@ pub async fn init_payment(
 ) -> Result<impl IntoResponse, AppError> {
     // Plan ve tutarı doğrula
     validate_plan_amount(&req.plan, &req.payment_amount)?;
+    validate_redirect_url(&req.merchant_ok_url, "merchant_ok_url")?;
+    validate_redirect_url(&req.merchant_fail_url, "merchant_fail_url")?;
 
     // member_id gönderilmemişse email'den bul
     let member_id = match req.member_id {
@@ -125,7 +137,7 @@ pub async fn init_payment(
                 merchant_oid: req.merchant_oid,
                 email: req.email,
                 payment_type: req.payment_type,
-                payment_amount: req.payment_amount,
+                payment_amount: req.payment_amount.clone(),
                 installment_count: req.installment_count,
                 no_installment: 1,
                 max_installment: 0,
@@ -154,6 +166,15 @@ pub async fn stored_card_payment(
     Json(req): Json<StoredCardPaymentRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     validate_plan_amount(&req.plan, &req.payment_amount)?;
+
+    // subscription_id'nin bu üyeye ait olduğunu doğrula
+    let sub = subscription_repo::find_by_id(&state.db, req.subscription_id)
+        .await
+        .map_err(anyhow::Error::from)?
+        .ok_or_else(|| AppError::BadRequest("Abonelik bulunamadı".to_string()))?;
+    if sub.member_id != req.member_id {
+        return Err(AppError::BadRequest("Abonelik bu kullanıcıya ait değil".to_string()));
+    }
 
     if req.require_cvv == 1 && req.cvv.is_none() {
         return Err(AppError::BadRequest("Bu kart için CVV zorunludur".to_string()));
@@ -284,7 +305,7 @@ struct PaytrSyncResponse {
 }
 
 
-/// PayTR sepet formatı: JSON.stringify([["Ürün Adı", "Fiyat", Adet], ...])
+/// PayTR sepet formatı: htmlEntities(JSON.stringify([["Ürün Adı", "Fiyat", Adet], ...]))
 fn encode_basket(items: &[BasketItem]) -> anyhow::Result<String> {
     let raw: Vec<[serde_json::Value; 3]> = items
         .iter()
@@ -296,5 +317,10 @@ fn encode_basket(items: &[BasketItem]) -> anyhow::Result<String> {
             ]
         })
         .collect();
-    Ok(serde_json::to_string(&raw)?)
+    let json = serde_json::to_string(&raw)?;
+    Ok(json
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;"))
 }

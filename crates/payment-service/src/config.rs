@@ -13,7 +13,7 @@ pub struct EmailConfig {
     pub site_url: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub merchant_id: String,
     pub merchant_key: String,
@@ -30,6 +30,21 @@ pub struct Config {
     pub max_failed_attempts: i32,
     /// Email ayarları — tüm SMTP değişkenleri tanımlıysa Some, değilse None.
     pub email: Option<EmailConfig>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("merchant_id", &self.merchant_id)
+            .field("merchant_key", &"[REDACTED]")
+            .field("merchant_salt", &"[REDACTED]")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("test_mode", &self.test_mode)
+            .field("database_url", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 /// Tüm SMTP env değişkenleri tanımlıysa EmailConfig döner, eksik varsa None.

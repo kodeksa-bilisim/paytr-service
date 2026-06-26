@@ -64,16 +64,18 @@ pub async fn find_by_oid(pool: &PgPool, merchant_oid: &str) -> Result<Option<Pay
     Ok(rec)
 }
 
-pub async fn set_success(pool: &PgPool, merchant_oid: &str) -> Result<()> {
-    sqlx::query(
+/// Atomik başarı işareti: yalnızca 'success' olmayan kayıtları günceller.
+/// İki eş zamanlı callback olduğunda sadece biri true alır; çift işlem önlenir.
+pub async fn set_success(pool: &PgPool, merchant_oid: &str) -> Result<bool> {
+    let r = sqlx::query(
         "UPDATE paytr_payments
          SET status = 'success', callback_received_at = NOW()
-         WHERE merchant_oid = $1",
+         WHERE merchant_oid = $1 AND status != 'success'",
     )
     .bind(merchant_oid)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(r.rows_affected() > 0)
 }
 
 pub async fn set_failed(

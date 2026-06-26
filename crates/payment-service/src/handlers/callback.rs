@@ -49,21 +49,37 @@ pub async fn payment_callback(
 
 async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Result<(), AppError> {
     // Ödeme kaydını çek
-    let payment = payment_repo::find_by_oid(&state.db, &payload.merchant_oid)
+    // "Bulunamadı" durumunda OK döndür — PayTR'nin yeniden denemesi bu durumu düzeltemez.
+    // Gerçek DB hatalarında ise Err döner, PayTR yeniden dener (geçici hata kurtarma).
+    let Some(payment) = payment_repo::find_by_oid(&state.db, &payload.merchant_oid)
         .await
         .map_err(anyhow::Error::from)?
-        .ok_or_else(|| AppError::BadRequest("Ödeme kaydı bulunamadı".to_string()))?;
-
-    // Çift callback koruması: zaten işlenmiş ise tekrar işleme
-    if payment.status == "success" {
-        tracing::warn!(merchant_oid = %payload.merchant_oid, "Tekrar callback, zaten işlendi");
+    else {
+        tracing::warn!(merchant_oid = %payload.merchant_oid, "Callback geldi fakat ödeme kaydı bulunamadı — görmezden geliniyor");
         return Ok(());
-    }
+    };
 
-    // Ödeme kaydını başarılı yap
-    payment_repo::set_success(&state.db, &payload.merchant_oid)
-        .await
-        .map_err(anyhow::Error::from)?;
+    // Çift callback koruması: payment success VE subscription aktifse tekrar işleme.
+    // payment=success ama subscription=pending durumunda (örn. kart parse hatası sonrası)
+    // abonelik aktivasyonuna devam et.
+    if payment.status == "success" {
+        let sub_already_active = match payment.subscription_id {
+            None => true,
+            Some(sub_id) => subscription_repo::find_by_id(&state.db, sub_id)
+                .await
+                .map_err(anyhow::Error::from)?
+                .map(|s| s.status != "pending")
+                .unwrap_or(true),
+        };
+        if sub_already_active {
+            tracing::warn!(merchant_oid = %payload.merchant_oid, "Tekrar callback, zaten işlendi");
+            return Ok(());
+        }
+        tracing::warn!(
+            merchant_oid = %payload.merchant_oid,
+            "Ödeme başarılı ama abonelik hâlâ pending, aktivasyon yeniden deneniyor"
+        );
+    }
 
     let member_id = payment.member_id;
 
@@ -144,6 +160,12 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
     .await
     .map_err(anyhow::Error::from)?;
 
+    // Atomik başarı işareti: eş zamanlı iki callback gelirse yalnızca biri
+    // günceller (TOCTOU koruması). İkincisi false alır ama iş zaten yapıldı.
+    payment_repo::set_success(&state.db, &payload.merchant_oid)
+        .await
+        .map_err(anyhow::Error::from)?;
+
     // Scheduler denemelerini sıfırla
     let _ = subscription_repo::reset_renewal_attempts(&state.db, subscription_id).await;
 
@@ -188,7 +210,7 @@ async fn handle_failed(state: &crate::AppData, payload: &CallbackPayload) -> Res
         .await
         .map_err(anyhow::Error::from)?;
 
-    if let Some(p) = payment {
+    if let Some(ref p) = payment {
         customer_repo::increment_failed_attempts(&state.db, p.member_id)
             .await
             .map_err(anyhow::Error::from)?;
@@ -203,11 +225,7 @@ async fn handle_failed(state: &crate::AppData, payload: &CallbackPayload) -> Res
 
     // Başarısız ödeme email bildirimi
     if let (Some(mailer), Some(email_cfg)) = (&state.mailer, &state.config.email) {
-        if let Some(p) = payment_repo::find_by_oid(&state.db, &payload.merchant_oid)
-            .await
-            .ok()
-            .flatten()
-        {
+        if let Some(p) = payment {
             // Kullanıcı emailini abonelik üzerinden bul
             if let Some(sub_id) = p.subscription_id {
                 if let Ok(Some(sub)) = subscription_repo::find_by_id(&state.db, sub_id).await {
@@ -261,6 +279,8 @@ async fn fetch_paytr_cards(state: &crate::AppData, utoken: &str) -> Result<Vec<C
         .await
         .map_err(|e| anyhow::anyhow!("PayTR kart listesi parse hatası: {}", e))?;
 
+    // Hata durumunda PayTR {"status":"error","err_msg":"..."} objesi döner.
+    // Başarıda doğrudan kart array'i döner: [{...}, ...].
     if body.get("status").and_then(|s| s.as_str()) == Some("error") {
         let msg = body.get("err_msg").and_then(|v| v.as_str()).unwrap_or("Bilinmeyen hata");
         return Err(AppError::PaytrError(msg.to_string()));
