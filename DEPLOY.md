@@ -77,8 +77,11 @@ Build:
 
 ```bash
 cd /mnt/c/Dev/MyWorks/paytr_subscription/paytr-service
-SQLX_OFFLINE=true cargo build --release
+cargo build --release
 ```
+
+> **Not:** `SQLX_OFFLINE=true` **gerekmez.** Proje yalnızca `sqlx::query()` fonksiyon formunu kullanıyor;
+> compile-time DB bağlantısı gerektiren `query!()` makrosu yok.
 
 Binary çıktısı: `target/release/payment-service`
 
@@ -86,26 +89,37 @@ Binary çıktısı: `target/release/payment-service`
 
 ## 7. WSL2 SSH Ayarı (ilk sefer)
 
-WSL2 içinde Windows SSH config'ini kopyala:
+### Deploy anahtarı oluştur ve sunucuya ekle
+
+WSL terminalinde çalıştır:
 
 ```bash
-cp -r /mnt/c/Users/coder/.ssh ~/.ssh
-chmod 700 ~/.ssh
-chmod 600 ~/.ssh/*
+# 1. Passphrase'siz deploy key üret
+ssh-keygen -t ed25519 -f ~/.ssh/nlink_deploy -N '' -C 'nlink-deploy-wsl'
+
+# 2. Public key'i sunucuya ekle — sunucu şifresini bir kez girmeni ister
+ssh-copy-id -i ~/.ssh/nlink_deploy.pub -p 25416 admin@104.249.19.39
+
+# 3. Test et (şifre sormamalı)
+ssh nlink 'echo OK'
 ```
 
-SSH config yoksa elle ekle:
+### WSL SSH config
 
-```bash
-nano ~/.ssh/config
-```
+`~/.ssh/config` içeriği (otomatik oluşturuldu):
 
 ```
 Host nlink
     HostName 104.249.19.39
     User admin
     Port 25416
+    IdentityFile ~/.ssh/nlink_deploy
+    IdentitiesOnly yes
 ```
+
+> **Neden ayrı key?** Windows'taki `id_rsa` Windows SSH agent'ı tarafından yönetilir.
+> WSL'de doğrudan `/mnt/c/...` yolundaki key'i kullanmak izin hataları verir (777 izinler).
+> Ayrı bir WSL deploy key kullanmak hem güvenli hem sorunsuz çalışır.
 
 ---
 
@@ -175,15 +189,32 @@ sudo systemctl status paytr-service
 
 ## Güncelleme (Sonraki Sürümler)
 
-Kod değişikliği sonrası binary'yi yenilemek için:
+Kod değişikliği sonrası WSL2 terminalinde:
 
 ```bash
-# WSL2 içinde
-cd /mnt/c/Dev/MyWorks/paytr_subscription/paytr-service
-SQLX_OFFLINE=true cargo build --release
-scp target/release/payment-service nlink:/opt/paytr-service/payment-service
-ssh nlink "sudo systemctl restart paytr-service"
+# İlk seferinde execute biti ver (bir kez yeterli):
+chmod +x /mnt/c/Dev/MyWorks/paytr_subscription/paytr-service/deploy.sh
+
+bash /mnt/c/Dev/MyWorks/paytr_subscription/paytr-service/deploy.sh
 ```
+
+`.env` de güncellenecekse (yeni env değişkeni eklendi vb.):
+
+```bash
+bash deploy.sh --env
+```
+
+### deploy.sh ne yapar?
+
+1. `cargo build --release` ile binary üretir
+2. `sudo systemctl stop paytr-service` — servisi durdurur (çalışan binary üzerine yazılamaz)
+3. `scp` ile binary'yi kopyalar
+4. `sudo systemctl start paytr-service` — servisi başlatır
+5. Hata olursa bile servisi yeniden başlatmayı dener (trap)
+6. Son durumu ekrana basar
+
+> **Neden önce stop?** Linux'ta çalışan bir binary'nin üzerine `scp` ile yazmak
+> "Text file busy" hatası verir. Servisi durdurup kopyalamak çözümdür.
 
 ---
 
