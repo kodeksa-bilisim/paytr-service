@@ -49,7 +49,8 @@ pub async fn set_subscription_active(
             payment_method        = 'paytr',
             user_type             = $5,
             failed_payment_attempts = 0,
-            custom_plan           = $7
+            custom_plan           = $7,
+            scheduled_plan        = NULL
         WHERE member_id = $6
         "#,
     )
@@ -92,6 +93,25 @@ pub async fn set_subscription_expired(pool: &PgPool, member_id: i32) -> Result<(
     .bind(member_id)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Downgrade planlanmış olarak işaretler (dönem sonunda geçiş).
+pub async fn set_scheduled_plan(pool: &PgPool, member_id: i32, plan: &str) -> Result<()> {
+    sqlx::query("UPDATE customers SET scheduled_plan = $1 WHERE member_id = $2")
+        .bind(plan)
+        .bind(member_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Planlanmış downgrade'i iptal eder.
+pub async fn clear_scheduled_plan(pool: &PgPool, member_id: i32) -> Result<()> {
+    sqlx::query("UPDATE customers SET scheduled_plan = NULL WHERE member_id = $1")
+        .bind(member_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

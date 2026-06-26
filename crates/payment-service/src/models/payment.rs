@@ -85,6 +85,27 @@ pub struct EnterpriseInitRequest {
     pub debug_on: Option<u8>,
 }
 
+/// Downgrade planlaması — ödeme alınmaz, dönem sonunda plan değişir.
+#[derive(Debug, Deserialize)]
+pub struct ScheduleDowngradeRequest {
+    pub member_id: i32,
+    pub email: String,
+    pub new_plan: String, // "silver" | "standard"
+}
+
+/// Planlanmış downgrade'i iptal eder.
+#[derive(Debug, Deserialize)]
+pub struct CancelScheduleRequest {
+    pub member_id: i32,
+}
+
+/// Downgrade planlama yanıtı.
+#[derive(Debug, Serialize)]
+pub struct ScheduleDowngradeResponse {
+    pub scheduled: bool,
+    pub effective_date: Option<String>, // ISO date string
+}
+
 fn default_payment_type() -> String { "card".to_string() }
 fn default_currency() -> String { "TL".to_string() }
 fn default_lang() -> String { "tr".to_string() }

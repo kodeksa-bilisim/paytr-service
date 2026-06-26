@@ -153,32 +153,34 @@ pub async fn renew(
 pub struct DueSubscription {
     pub subscription_id: i32,
     pub member_id: i32,
-    pub plan: String,
+    pub plan: String,           // Efektif plan (COALESCE ile scheduled_plan öncelikli)
     pub billing_cycle: String,
-    pub amount: String,
+    pub amount: String,         // Efektif tutar
     pub currency: String,
     pub utoken: String,
     pub ctoken: String,
     pub require_cvv: bool,
     pub user_phone: String,
     pub user_email: String,
+    pub original_plan: String,  // Asıl plan (scheduled_plan'ın set edilip edilmediğini anlamak için)
 }
 
 pub async fn query_due(pool: &PgPool, max_failed_attempts: i32) -> Result<Vec<DueSubscription>> {
     let rows = sqlx::query_as::<_, DueSubscription>(
         r#"
         SELECT
-            s.id            AS subscription_id,
+            s.id                                                        AS subscription_id,
             s.member_id,
-            s.plan,
+            COALESCE(s.scheduled_plan, s.plan)                         AS plan,
             s.billing_cycle,
-            s.amount,
+            COALESCE(s.scheduled_amount, s.amount)                     AS amount,
             s.currency,
             s.utoken,
             s.ctoken,
             c.require_cvv,
-            COALESCE(s.user_phone, '') AS user_phone,
-            COALESCE(s.user_email, cu.email, '') AS user_email
+            COALESCE(s.user_phone, '')                                  AS user_phone,
+            COALESCE(s.user_email, cu.email, '')                       AS user_email,
+            s.plan                                                      AS original_plan
         FROM paytr_subscriptions s
         JOIN paytr_cards c
             ON c.ctoken = s.ctoken AND c.is_active = TRUE
@@ -236,6 +238,83 @@ pub async fn reset_renewal_attempts(pool: &PgPool, subscription_id: i32) -> Resu
          WHERE id = $1",
     )
     .bind(subscription_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Gold → Silver gibi downgrade için mevcut aktif aboneliğe gelecek dönem planı kaydeder.
+pub async fn set_scheduled_downgrade(
+    pool: &PgPool,
+    subscription_id: i32,
+    plan: &str,
+    amount: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE paytr_subscriptions SET scheduled_plan = $1, scheduled_amount = $2, updated_at = NOW()
+         WHERE id = $3",
+    )
+    .bind(plan)
+    .bind(amount)
+    .bind(subscription_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Planlanmış downgrade'i iptal eder.
+pub async fn cancel_scheduled(pool: &PgPool, subscription_id: i32) -> Result<()> {
+    sqlx::query(
+        "UPDATE paytr_subscriptions SET scheduled_plan = NULL, scheduled_amount = NULL, updated_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(subscription_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Yenileme + plan değişikliği: scheduled_plan/amount temizlenir, plan güncellenir.
+pub async fn renew_with_plan(
+    pool: &PgPool,
+    id: i32,
+    plan: &str,
+    expires_at: NaiveDateTime,
+    next_payment_date: NaiveDateTime,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE paytr_subscriptions
+        SET plan              = $1,
+            expires_at        = $2,
+            next_payment_date = $3,
+            scheduled_plan    = NULL,
+            scheduled_amount  = NULL,
+            updated_at        = NOW()
+        WHERE id = $4
+        "#,
+    )
+    .bind(plan)
+    .bind(expires_at)
+    .bind(next_payment_date)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Plan değişikliğinde (upgrade/downgrade) yeni abonelik aktifleştikten sonra
+/// aynı kullanıcının diğer tüm aktif aboneliklerini iptal eder.
+pub async fn cancel_active_except(pool: &PgPool, member_id: i32, keep_id: i32) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE paytr_subscriptions
+        SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()
+        WHERE member_id = $1 AND id != $2 AND status = 'active'
+        "#,
+    )
+    .bind(member_id)
+    .bind(keep_id)
     .execute(pool)
     .await?;
     Ok(())

@@ -83,6 +83,8 @@ pub struct PaytrSubscription {
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
     pub metadata: Option<Value>,
+    pub scheduled_plan: Option<String>,
+    pub scheduled_amount: Option<String>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]

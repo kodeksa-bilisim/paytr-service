@@ -117,15 +117,28 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
 
     let now = chrono::Utc::now().naive_utc();
 
-    // İlk ödeme: now'dan başlat. Yenileme: mevcut expires_at'ten başlat (gün kaybı önlenir).
-    let period_start = if sub.status == "pending" {
-        now
+    let is_first_payment = sub.status == "pending";
+
+    // Upgrade: mevcut aboneliğin kalan süresi yeni plana aktarılır.
+    // previous_expires_at metadata'da varsa period_start olarak kullanılır.
+    let upgrade_start = if is_first_payment {
+        sub.metadata.as_ref()
+            .and_then(|m| m.get("previous_expires_at")?.as_str())
+            .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok())
+            .map(|exp| exp.max(now))
+    } else {
+        None
+    };
+
+    let period_start = if is_first_payment {
+        upgrade_start.unwrap_or(now)
     } else {
         sub.expires_at.unwrap_or(now).max(now)
     };
+
     let (expires_at, next_payment_date) = billing_dates(&sub.billing_cycle, period_start);
 
-    if sub.status == "pending" {
+    if is_first_payment {
         // İlk ödeme: pending → active
         let utoken = active_utoken.as_deref().unwrap_or("");
         let ctoken = if let Some(ref ut) = active_utoken {
@@ -141,15 +154,34 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
         subscription_repo::activate(&state.db, subscription_id, utoken, &ctoken, now, expires_at, next_payment_date)
             .await
             .map_err(anyhow::Error::from)?;
-    } else {
-        // Yenileme
-        subscription_repo::renew(&state.db, subscription_id, expires_at, next_payment_date)
+
+        // Upgrade: yeni abonelik aktifleşince önceki aktif aboneliği iptal et.
+        subscription_repo::cancel_active_except(&state.db, member_id, subscription_id)
             .await
             .map_err(anyhow::Error::from)?;
+    } else {
+        // Yenileme: scheduled_plan varsa plan değişikliği ile yenile (downgrade).
+        let effective_plan = sub.scheduled_plan.clone().unwrap_or_else(|| sub.plan.clone());
+        if sub.scheduled_plan.is_some() {
+            subscription_repo::renew_with_plan(&state.db, subscription_id, &effective_plan, expires_at, next_payment_date)
+                .await
+                .map_err(anyhow::Error::from)?;
+        } else {
+            subscription_repo::renew(&state.db, subscription_id, expires_at, next_payment_date)
+                .await
+                .map_err(anyhow::Error::from)?;
+        }
     }
 
     // 6. customers tablosunu güncelle
-    let custom_plan = if sub.plan == "enterprise" {
+    // Yenilemede effective_plan kullanılır (downgrade yenileme için).
+    let effective_plan_for_customer = if is_first_payment {
+        sub.plan.clone()
+    } else {
+        sub.scheduled_plan.clone().unwrap_or_else(|| sub.plan.clone())
+    };
+
+    let custom_plan = if effective_plan_for_customer == "enterprise" {
         sub.metadata.as_ref().and_then(|m| {
             let extra_links = m.get("extra_links")?.as_i64()?;
             let extra_clicks = m.get("extra_clicks")?.as_i64()?;
@@ -165,7 +197,7 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
     customer_repo::set_subscription_active(
         &state.db,
         member_id,
-        &sub.plan,
+        &effective_plan_for_customer,
         subscription_id,
         expires_at,
         next_payment_date,

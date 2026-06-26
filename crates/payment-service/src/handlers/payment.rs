@@ -6,12 +6,32 @@ use crate::{
     db::{customer_repo, payment_repo, subscription_repo},
     error::AppError,
     models::payment::{
-        BasketItem, EnterpriseInitRequest, InitPaymentRequest, InitPaymentResponse, PaytrFormParams,
+        BasketItem, CancelScheduleRequest, EnterpriseInitRequest, InitPaymentRequest,
+        InitPaymentResponse, PaytrFormParams, ScheduleDowngradeRequest, ScheduleDowngradeResponse,
         StoredCardPaymentRequest, StoredCardPaymentResponse,
     },
     paytr_client::PAYTR_PAYMENT_ENDPOINT,
     AppState,
 };
+
+/// Planın sıralaması: düşük = düşük plan. Upgrade/downgrade tespiti için.
+fn plan_rank(plan: &str) -> u8 {
+    match plan.to_lowercase().as_str() {
+        "silver"     => 1,
+        "gold"       => 2,
+        "enterprise" => 3,
+        _            => 0, // standard / free
+    }
+}
+
+/// Plan adına karşılık gelen TL tutarı döner.
+fn plan_amount_tl(plan: &str) -> Option<&'static str> {
+    match plan.to_lowercase().as_str() {
+        "silver" => Some("149.00"),
+        "gold"   => Some("299.00"),
+        _        => None,
+    }
+}
 
 /// Redirect URL'nin güvenli olduğunu doğrular: yalnızca https:// kabul edilir.
 fn validate_redirect_url(url: &str, field: &str) -> Result<(), AppError> {
@@ -26,13 +46,13 @@ fn validate_redirect_url(url: &str, field: &str) -> Result<(), AppError> {
 /// Plan ile tutar uyumunu doğrular — frontend manipülasyonunu önler.
 fn validate_plan_amount(plan: &str, amount: &str) -> Result<(), AppError> {
     let expected = match plan {
-        "silver" => "14900",
-        "gold"   => "29900",
+        "silver" => "149.00",
+        "gold"   => "299.00",
         _ => return Err(AppError::BadRequest(format!("Geçersiz plan: {}", plan))),
     };
     if amount != expected {
         return Err(AppError::BadRequest(format!(
-            "Tutar plan ile uyuşmuyor (beklenen: {} kuruş)",
+            "Tutar plan ile uyuşmuyor (beklenen: {} TL)",
             expected
         )));
     }
@@ -60,6 +80,22 @@ pub async fn init_payment(
     let user_basket = encode_basket(&req.user_basket)
         .map_err(|e| AppError::BadRequest(format!("Sepet hatası: {}", e)))?;
 
+    // Upgrade ise mevcut aktif aboneliğin bitiş tarihini metadata'ya kaydet (kalan süre aktarılır).
+    let active_sub = subscription_repo::find_active(&state.db, member_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    let metadata = active_sub.as_ref().and_then(|sub| {
+        let is_upgrade = plan_rank(&req.plan) > plan_rank(&sub.plan);
+        if is_upgrade {
+            sub.expires_at.map(|exp| {
+                serde_json::json!({ "previous_expires_at": exp.format("%Y-%m-%dT%H:%M:%S").to_string() })
+            })
+        } else {
+            None
+        }
+    });
+
     // Mevcut pending aboneliği temizle (tekrar tıklama / modal yeniden açma)
     subscription_repo::cancel_pending(&state.db, member_id)
         .await
@@ -75,7 +111,7 @@ pub async fn init_payment(
         &req.currency,
         &req.user_phone,
         &req.email,
-        None,
+        metadata,
     )
     .await
     .map_err(anyhow::Error::from)?;
@@ -326,7 +362,7 @@ pub async fn init_enterprise_payment(
         + extra_users * 15000
         + (req.extra_links as i64) * 10000
         + (req.extra_clicks as i64) * 5000;
-    let payment_amount = total_kurus.to_string();
+    let payment_amount = format!("{:.2}", total_kurus as f64 / 100.0); // TL cinsinden
 
     let basket_label = format!(
         "Enterprise Plan ({} kullanıcı, {}k link/ay, {}k tıklama/ay)",
@@ -334,10 +370,9 @@ pub async fn init_enterprise_payment(
         10 + req.extra_links,
         100 + req.extra_clicks * 10,
     );
-    let price_tl = format!("{:.2}", total_kurus as f64 / 100.0);
     let basket_items = vec![BasketItem {
         name: basket_label,
-        price: price_tl,
+        price: payment_amount.clone(),
         quantity: 1,
     }];
     let user_basket = encode_basket(&basket_items)
@@ -445,6 +480,72 @@ pub async fn init_enterprise_payment(
             },
         }),
     ))
+}
+
+/// Downgrade planlama: ödeme alınmaz, mevcut plan dönem sonuna kadar devam eder.
+pub async fn schedule_downgrade(
+    State(state): State<AppState>,
+    Json(req): Json<ScheduleDowngradeRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let new_rank = plan_rank(&req.new_plan);
+    let new_amount = plan_amount_tl(&req.new_plan)
+        .ok_or_else(|| AppError::BadRequest(format!("Geçersiz plan: {}", req.new_plan)))?;
+
+    let active_sub = subscription_repo::find_active(&state.db, req.member_id)
+        .await
+        .map_err(anyhow::Error::from)?
+        .ok_or_else(|| AppError::BadRequest("Aktif abonelik bulunamadı".to_string()))?;
+
+    if plan_rank(&active_sub.plan) <= new_rank {
+        return Err(AppError::BadRequest(
+            "Bu işlem yalnızca daha düşük bir plana geçiş için geçerlidir".to_string(),
+        ));
+    }
+
+    subscription_repo::set_scheduled_downgrade(&state.db, active_sub.id, &req.new_plan, new_amount)
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    customer_repo::set_scheduled_plan(&state.db, req.member_id, &req.new_plan)
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    let effective_date = active_sub
+        .expires_at
+        .map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string());
+
+    tracing::info!(
+        member_id = req.member_id,
+        current_plan = %active_sub.plan,
+        new_plan = %req.new_plan,
+        effective_date = ?effective_date,
+        "Downgrade planlandı"
+    );
+
+    Ok((StatusCode::OK, Json(ScheduleDowngradeResponse { scheduled: true, effective_date })))
+}
+
+/// Planlanmış downgrade'i iptal eder; mevcut plan dönem sonunda yenilenir.
+pub async fn cancel_scheduled_downgrade(
+    State(state): State<AppState>,
+    Json(req): Json<CancelScheduleRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let active_sub = subscription_repo::find_active(&state.db, req.member_id)
+        .await
+        .map_err(anyhow::Error::from)?
+        .ok_or_else(|| AppError::BadRequest("Aktif abonelik bulunamadı".to_string()))?;
+
+    subscription_repo::cancel_scheduled(&state.db, active_sub.id)
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    customer_repo::clear_scheduled_plan(&state.db, req.member_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    tracing::info!(member_id = req.member_id, "Planlanmış downgrade iptal edildi");
+
+    Ok((StatusCode::OK, Json(serde_json::json!({ "cancelled": true }))))
 }
 
 /// PayTR sepet formatı: htmlEntities(JSON.stringify([["Ürün Adı", "Fiyat", Adet], ...]))
