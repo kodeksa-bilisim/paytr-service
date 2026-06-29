@@ -92,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/payments/fail", get(handlers::payment_fail))
         // Abonelik yönetimi
         .route("/api/v1/subscriptions/cancel", post(handlers::subscription::cancel_subscription))
+        .route("/api/v1/subscriptions/reactivate", post(handlers::subscription::reactivate_subscription))
         .route("/api/v1/subscriptions/schedule-downgrade", post(handlers::payment::schedule_downgrade))
         .route("/api/v1/subscriptions/cancel-schedule", post(handlers::payment::cancel_scheduled_downgrade))
         // Kart yönetimi

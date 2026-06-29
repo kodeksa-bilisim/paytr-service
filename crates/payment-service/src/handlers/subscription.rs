@@ -17,6 +17,11 @@ pub struct CancelRequest {
     pub subscription_id: i32,
 }
 
+#[derive(Deserialize)]
+pub struct ReactivateRequest {
+    pub member_id: i32,
+}
+
 pub async fn cancel_subscription(
     State(state): State<AppState>,
     Json(req): Json<CancelRequest>,
@@ -66,6 +71,29 @@ pub async fn cancel_subscription(
             }
         }
     }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn reactivate_subscription(
+    State(state): State<AppState>,
+    Json(req): Json<ReactivateRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let reactivated = subscription_repo::reactivate_by_member(&state.db, req.member_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    if !reactivated {
+        return Err(AppError::BadRequest(
+            "Geri alınabilecek iptal edilmiş abonelik bulunamadı".to_string(),
+        ));
+    }
+
+    customer_repo::set_subscription_reactivated(&state.db, req.member_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    tracing::info!(member_id = req.member_id, "Abonelik iptali geri alındı");
 
     Ok(StatusCode::NO_CONTENT)
 }

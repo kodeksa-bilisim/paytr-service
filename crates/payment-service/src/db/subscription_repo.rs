@@ -22,6 +22,23 @@ pub async fn cancel_by_member(pool: &PgPool, subscription_id: i32, member_id: i3
     Ok(result.rows_affected() > 0)
 }
 
+/// İptal edilen aboneliği geri alır; sadece süresi dolmamış 'cancelled' abonelik için geçerlidir.
+pub async fn reactivate_by_member(pool: &PgPool, member_id: i32) -> Result<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE paytr_subscriptions
+        SET status = 'active', cancelled_at = NULL, updated_at = NOW()
+        WHERE member_id = $1
+          AND status = 'cancelled'
+          AND expires_at > NOW()
+        "#,
+    )
+    .bind(member_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Yeni ödeme başlamadan önce aynı kullanıcının eski pending aboneliklerini temizler.
 pub async fn cancel_pending(pool: &PgPool, member_id: i32) -> Result<()> {
     sqlx::query(

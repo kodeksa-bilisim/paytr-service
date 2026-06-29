@@ -79,6 +79,17 @@ pub async fn set_subscription_cancelled(pool: &PgPool, member_id: i32) -> Result
     Ok(())
 }
 
+/// Abonelik iptali geri alındığında subscription_status = 'active' yazar.
+pub async fn set_subscription_reactivated(pool: &PgPool, member_id: i32) -> Result<()> {
+    sqlx::query(
+        "UPDATE customers SET subscription_status = 'active' WHERE member_id = $1",
+    )
+    .bind(member_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Abonelik süresi dolduğunda customers'ı Standard'a düşürür.
 pub async fn set_subscription_expired(pool: &PgPool, member_id: i32) -> Result<()> {
     sqlx::query(
