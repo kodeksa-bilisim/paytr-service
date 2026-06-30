@@ -11,7 +11,7 @@ REMOTE_HOST="nlink"
 REMOTE_DIR="/opt/paytr-service"
 REMOTE_BIN="$REMOTE_DIR/payment-service"
 SERVICE="paytr-service"
-SEND_ENV=false
+SEND_ENV=true
 
 for arg in "$@"; do
   [[ "$arg" == "--env" ]] && SEND_ENV=true

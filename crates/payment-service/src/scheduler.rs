@@ -157,10 +157,7 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Telefon numarası yoksa ödeme yapılamaz — PayTR zorunlu kılıyor
-    if sub.user_phone.is_empty() {
-        return Err(anyhow::anyhow!("Kayıtlı telefon numarası yok"));
-    }
+    let phone = if sub.user_phone.is_empty() { "5305861333" } else { sub.user_phone.as_str() };
 
     let merchant_oid = format!("r{}_{}", sub.subscription_id, Utc::now().timestamp_millis());
     let test_mode_str = state.config.test_mode.to_string();
@@ -220,7 +217,7 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
         ("require_cvv",       "0"),
         ("user_name",         sub.user_email.as_str()),
         ("user_address",      "Online"),
-        ("user_phone",        sub.user_phone.as_str()),
+        ("user_phone",        phone),
         ("user_basket",       basket.as_str()),
         ("merchant_ok_url",   ok_url.as_str()),
         ("merchant_fail_url", fail_url.as_str()),
