@@ -3,7 +3,7 @@ use serde::Deserialize;
 
 use crate::{
     db::{customer_repo, subscription_repo},
-    email,
+    email, email_templates,
     error::AppError,
     AppState,
 };
@@ -52,17 +52,14 @@ pub async fn cancel_subscription(
         if let Ok(Some(sub)) = subscription_repo::find_by_id(&state.db, req.subscription_id).await {
             let to = sub.user_email.as_deref().unwrap_or("");
             if !to.is_empty() {
-                let expires_str = sub
-                    .expires_at
-                    .map(|d| d.format("%d.%m.%Y").to_string())
-                    .unwrap_or_else(|| "—".to_string());
-
-                let (subject, html) = email::tpl_subscription_cancelled(
+                let name = customer_repo::find_name(&state.db, req.member_id).await;
+                let content = email_templates::subscription_cancelled(
+                    name.as_deref(),
                     &sub.plan,
-                    &expires_str,
+                    sub.expires_at,
                     &email_cfg.site_url,
                 );
-                email::send(mailer, email_cfg, to, subject, html).await;
+                email::send(mailer, email_cfg, to, content).await;
             }
         }
     }

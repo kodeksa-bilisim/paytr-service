@@ -2,6 +2,16 @@ use anyhow::Result;
 use chrono::NaiveDateTime;
 use sqlx::{PgExecutor, PgPool};
 
+/// E-posta hitabı için müşteri adı (bulunamazsa ya da hata olursa None).
+pub async fn find_name(pool: &PgPool, member_id: i32) -> Option<String> {
+    sqlx::query_scalar::<_, String>("SELECT name FROM customers WHERE member_id = $1")
+        .bind(member_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
 /// plan adını PascalCase'e çevirir ("silver" → "Silver").
 /// qurlbackend Membership enum'ı PascalCase bekler.
 fn plan_to_user_type(plan: &str) -> String {

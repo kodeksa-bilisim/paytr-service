@@ -4,7 +4,7 @@ use chrono::Months;
 use crate::{
     crypto::{generate_card_list_token, verify_callback_hash},
     db::{card_repo, customer_repo, payment_repo, subscription_repo},
-    email,
+    email, email_templates,
     error::AppError,
     models::{
         callback::{CallbackPayload, PaymentStatus},
@@ -275,14 +275,20 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
     if let (Some(mailer), Some(email_cfg)) = (&state.mailer, &state.config.email) {
         let to = sub.user_email.as_deref().unwrap_or("");
         if !to.is_empty() {
-            let expires_str = expires_at.format("%d.%m.%Y").to_string();
-            let (subject, html) = email::tpl_payment_success(
-                &effective_plan,
-                &expires_str,
+            let name = customer_repo::find_name(&state.db, member_id).await;
+            let content = email_templates::payment_success(
+                &email_templates::PaymentInfo {
+                    name: name.as_deref(),
+                    plan: &effective_plan,
+                    amount: &payment.amount,
+                    expires_at,
+                    order_no: &payload.merchant_oid,
+                    site_url: &email_cfg.site_url,
+                },
                 is_first_payment,
-                &email_cfg.site_url,
+                customer_status == "active",
             );
-            email::send(mailer, email_cfg, to, subject, html).await;
+            email::send(mailer, email_cfg, to, content).await;
         }
     }
 
@@ -333,13 +339,16 @@ async fn handle_failed(state: &crate::AppData, payload: &CallbackPayload) -> Res
                 let to = sub.user_email.as_deref().unwrap_or("");
                 if !to.is_empty() {
                     let remaining = (state.config.max_failed_attempts - sub.renewal_attempts).max(0);
-                    let (subject, html) = email::tpl_payment_failed(
+                    let name = customer_repo::find_name(&state.db, p.member_id).await;
+                    let content = email_templates::payment_failed(
+                        name.as_deref(),
                         &sub.plan,
+                        &p.amount,
                         payload.failed_reason_msg.as_deref(),
                         remaining,
                         &email_cfg.site_url,
                     );
-                    email::send(mailer, email_cfg, to, subject, html).await;
+                    email::send(mailer, email_cfg, to, content).await;
                 }
             }
         }

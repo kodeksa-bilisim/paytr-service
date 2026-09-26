@@ -7,7 +7,7 @@ use crate::{
     crypto::generate_payment_token,
     db::{customer_repo, payment_repo, subscription_repo},
     db::subscription_repo::DueSubscription,
-    email,
+    email, email_templates,
     paytr_client,
     AppState,
 };
@@ -95,13 +95,16 @@ pub async fn process_due(state: &AppState) -> anyhow::Result<()> {
                             _ => 0,
                         };
                         // Kullanıcıya iç hata ayrıntısı gönderilmez.
-                        let (subject, html) = email::tpl_payment_failed(
+                        let name = customer_repo::find_name(&state.db, sub.member_id).await;
+                        let content = email_templates::payment_failed(
+                            name.as_deref(),
                             &sub.plan,
+                            &sub.amount,
                             None,
                             remaining,
                             &email_cfg.site_url,
                         );
-                        email::send(mailer, email_cfg, to, subject, html).await;
+                        email::send(mailer, email_cfg, to, content).await;
                     }
                 }
             }
@@ -154,11 +157,13 @@ async fn notify_cvv_required(state: &AppState) {
         id: i32,
         plan: String,
         email: String,
+        name: String,
+        expires_at: Option<chrono::NaiveDateTime>,
     }
 
     let rows = sqlx::query_as::<_, CvvRow>(
         r#"
-        SELECT s.id, s.plan, COALESCE(s.user_email, cu.email, '') AS email
+        SELECT s.id, s.plan, COALESCE(s.user_email, cu.email, '') AS email, cu.name, s.expires_at
         FROM paytr_subscriptions s
         JOIN paytr_cards c ON c.ctoken = s.ctoken AND c.is_active = TRUE
         JOIN customers cu ON cu.member_id = s.member_id
@@ -177,8 +182,13 @@ async fn notify_cvv_required(state: &AppState) {
             for row in rows {
                 let _ = subscription_repo::mark_renewal_attempt(&state.db, row.id).await;
                 if row.email.is_empty() { continue; }
-                let (subject, html) = email::tpl_cvv_required(&row.plan, &email_cfg.site_url);
-                email::send(mailer, email_cfg, &row.email, subject, html).await;
+                let content = email_templates::cvv_required(
+                    Some(&row.name),
+                    &row.plan,
+                    row.expires_at,
+                    &email_cfg.site_url,
+                );
+                email::send(mailer, email_cfg, &row.email, content).await;
             }
         }
     }

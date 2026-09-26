@@ -1,10 +1,11 @@
 use lettre::{
-    message::{header::ContentType, Mailbox},
+    message::{Mailbox, MultiPart},
     transport::smtp::authentication::Credentials,
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
 
 use crate::config::EmailConfig;
+use crate::email_templates::EmailContent;
 
 pub type Mailer = AsyncSmtpTransport<Tokio1Executor>;
 
@@ -29,8 +30,9 @@ pub async fn check_connection(mailer: &Mailer) {
     }
 }
 
-/// Emaili gönderir. Hata olursa loglar, panic etmez.
-pub async fn send(mailer: &Mailer, cfg: &EmailConfig, to: &str, subject: &str, html: String) {
+/// E-postayı düz metin + HTML (multipart/alternative) olarak gönderir.
+/// Hata olursa loglar, panic etmez; çağıranın akışını etkilemez.
+pub async fn send(mailer: &Mailer, cfg: &EmailConfig, to: &str, content: EmailContent) {
     let from: Mailbox = match format!("{} <{}>", cfg.from_name, cfg.from_address).parse() {
         Ok(m) => m,
         Err(e) => {
@@ -46,12 +48,13 @@ pub async fn send(mailer: &Mailer, cfg: &EmailConfig, to: &str, subject: &str, h
         }
     };
 
+    let subject = content.subject.clone();
     let msg = match Message::builder()
-        .from(from)
+        .from(from.clone())
+        .reply_to(from)
         .to(to_box)
-        .subject(subject)
-        .header(ContentType::TEXT_HTML)
-        .body(html)
+        .subject(content.subject)
+        .multipart(MultiPart::alternative_plain_html(content.text, content.html))
     {
         Ok(m) => m,
         Err(e) => {
@@ -65,164 +68,4 @@ pub async fn send(mailer: &Mailer, cfg: &EmailConfig, to: &str, subject: &str, h
     } else {
         tracing::info!("Email gönderildi: {} → {}", subject, to);
     }
-}
-
-// ─── Şablonlar ────────────────────────────────────────────────────────────────
-
-pub fn tpl_payment_success(
-    plan: &str,
-    expires_at: &str,
-    is_first: bool,
-    site_url: &str,
-) -> (&'static str, String) {
-    let plan_label = plan_display(plan);
-    let (subject, heading, body) = if is_first {
-        (
-            "Aboneliğiniz aktif edildi ✓",
-            format!("{} planı aktif edildi", plan_label),
-            format!(
-                "Ödemeniz başarıyla alındı. <strong>{}</strong> planı <strong>{}</strong> tarihine kadar geçerlidir.",
-                plan_label, expires_at
-            ),
-        )
-    } else {
-        (
-            "Aboneliğiniz yenilendi ✓",
-            format!("{} planı yenilendi", plan_label),
-            format!(
-                "Aboneliğiniz otomatik olarak yenilendi. Yeni bitiş tarihi: <strong>{}</strong>",
-                expires_at
-            ),
-        )
-    };
-
-    let html = base_template(
-        &heading,
-        &body,
-        Some(("Planlara Git", &format!("{}/tr/app/plans", site_url))),
-    );
-    (subject, html)
-}
-
-pub fn tpl_payment_failed(
-    plan: &str,
-    reason: Option<&str>,
-    attempts_left: i32,
-    site_url: &str,
-) -> (&'static str, String) {
-    let plan_label = plan_display(plan);
-    let reason_text = html_escape(reason.unwrap_or("Banka tarafından reddedildi"));
-    let body = if attempts_left > 0 {
-        format!(
-            "<strong>{}</strong> planınızın yenileme ödemesi alınamadı.<br><br>Sebep: <em>{}</em><br><br>Ödeme günde bir olmak üzere <strong>{} kez</strong> daha denenecek. Kartınızı güncellemek için planlar sayfasını ziyaret edebilirsiniz.",
-            plan_label, reason_text, attempts_left
-        )
-    } else {
-        format!(
-            "<strong>{}</strong> planınızın yenileme ödemesi <strong>birden fazla kez</strong> alınamadı.<br><br>Sebep: <em>{}</em><br><br>Aboneliğiniz yenilenemedi. Tekrar abone olmak için planlar sayfasını ziyaret edin.",
-            plan_label, reason_text
-        )
-    };
-
-    let html = base_template(
-        "Ödeme başarısız",
-        &body,
-        Some(("Ödeme Yöntemini Güncelle", &format!("{}/tr/app/plans", site_url))),
-    );
-    ("Ödemeniz başarısız oldu", html)
-}
-
-pub fn tpl_cvv_required(plan: &str, site_url: &str) -> (&'static str, String) {
-    let plan_label = plan_display(plan);
-    let body = format!(
-        "<strong>{}</strong> planı için aboneliğiniz yenileme zamanı geldi, ancak kayıtlı kartınız güvenlik nedeniyle otomatik ödeme için uygun değil (CVV doğrulaması gerekiyor).<br><br>Aboneliğinizin devam etmesi için lütfen planlar sayfasından manuel ödeme yapın.",
-        plan_label
-    );
-    let html = base_template(
-        "Abonelik yenileme için işlem gerekiyor",
-        &body,
-        Some(("Planlar Sayfasına Git", &format!("{}/tr/app/plans", site_url))),
-    );
-    ("Abonelik yenileme için işlem gerekiyor", html)
-}
-
-pub fn tpl_subscription_cancelled(
-    plan: &str,
-    expires_at: &str,
-    site_url: &str,
-) -> (&'static str, String) {
-    let plan_label = plan_display(plan);
-    let body = format!(
-        "<strong>{}</strong> planı aboneliğiniz iptal edildi.<br><br>Aboneliğiniz <strong>{}</strong> tarihine kadar aktif kalmaya devam edecek, bu tarihten sonra ücretsiz plana geçilecek ve kayıtlı kartınız silinecektir. Bu tarihe kadar iptali planlar sayfasından geri alabilirsiniz.",
-        plan_label, expires_at
-    );
-    let html = base_template(
-        "Aboneliğiniz iptal edildi",
-        &body,
-        Some(("Planlar Sayfasına Git", &format!("{}/tr/app/plans", site_url))),
-    );
-    ("Aboneliğiniz iptal edildi", html)
-}
-
-fn plan_display(plan: &str) -> String {
-    match plan {
-        "gold"       => "Gold".to_string(),
-        "silver"     => "Silver".to_string(),
-        "enterprise" => "Enterprise".to_string(),
-        other        => html_escape(other),
-    }
-}
-
-/// Şablona giren değişken metinler (PayTR hata mesajı vb.) için.
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\x27', "&#39;")
-}
-
-fn base_template(heading: &str, body: &str, cta: Option<(&str, &str)>) -> String {
-    let cta_html = if let Some((label, url)) = cta {
-        format!(
-            r#"<p style="text-align:center;margin-top:28px">
-               <a href="{}" style="background:#7c3aed;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block">{}</a>
-               </p>"#,
-            url, label
-        )
-    } else {
-        String::new()
-    };
-
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="tr">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#0f0f0f;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
-  <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 20px">
-    <tr><td align="center">
-      <table width="560" cellpadding="0" cellspacing="0" style="background:#1a1a1a;border-radius:12px;border:1px solid #2a2a2a;overflow:hidden">
-        <tr>
-          <td style="background:#7c3aed;padding:24px 32px">
-            <p style="margin:0;font-size:22px;font-weight:700;color:#fff">nlink.tr</p>
-          </td>
-        </tr>
-        <tr>
-          <td style="padding:32px">
-            <h1 style="margin:0 0 16px;font-size:20px;font-weight:700;color:#f0f0f0">{heading}</h1>
-            <p style="margin:0;font-size:15px;line-height:1.6;color:#a0a0a0">{body}</p>
-            {cta}
-            <hr style="border:none;border-top:1px solid #2a2a2a;margin:28px 0">
-            <p style="margin:0;font-size:12px;color:#555">Bu e-postayı nlink.tr üzerindeki hesabınız nedeniyle aldınız. Sorularınız için <a href="mailto:destek@nlink.tr" style="color:#7c3aed">destek@nlink.tr</a> adresine yazabilirsiniz.</p>
-          </td>
-        </tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"#,
-        heading = heading,
-        body = body,
-        cta = cta_html,
-    )
 }

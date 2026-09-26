@@ -3,6 +3,7 @@ mod cards;
 mod crypto;
 mod db;
 mod email;
+mod email_templates;
 mod error;
 mod handlers;
 mod models;
