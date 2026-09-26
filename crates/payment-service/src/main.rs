@@ -84,8 +84,9 @@ async fn main() -> anyhow::Result<()> {
         .transpose()
         .map_err(|e| anyhow::anyhow!("SMTP mailer oluşturulamadı: {}", e))?;
 
-    if mailer.is_some() {
+    if let Some(m) = &mailer {
         tracing::info!("Email bildirimleri aktif");
+        email::check_connection(m).await;
     } else {
         tracing::warn!("SMTP ayarları eksik — email bildirimleri devre dışı");
     }

@@ -10,11 +10,23 @@ pub type Mailer = AsyncSmtpTransport<Tokio1Executor>;
 
 pub fn build_mailer(cfg: &EmailConfig) -> anyhow::Result<Mailer> {
     let creds = Credentials::new(cfg.smtp_username.clone(), cfg.smtp_password.clone());
-    let mailer = AsyncSmtpTransport::<Tokio1Executor>::relay(&cfg.smtp_host)?
-        .port(cfg.smtp_port)
-        .credentials(creds)
-        .build();
-    Ok(mailer)
+    // 465 = doğrudan TLS (SMTPS); diğerleri (Google Workspace: smtp.gmail.com:587) STARTTLS.
+    // Eskiden her portta `relay` (doğrudan TLS) kullanılıyordu → 587'de bağlantı kurulamazdı.
+    let builder = if cfg.smtp_port == 465 {
+        AsyncSmtpTransport::<Tokio1Executor>::relay(&cfg.smtp_host)?
+    } else {
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.smtp_host)?
+    };
+    Ok(builder.port(cfg.smtp_port).credentials(creds).build())
+}
+
+/// Açılışta SMTP bağlantısını ve kimlik doğrulamayı dener (mail göndermez); sonucu loglar.
+pub async fn check_connection(mailer: &Mailer) {
+    match mailer.test_connection().await {
+        Ok(true) => tracing::info!("SMTP bağlantısı ve kimlik doğrulama başarılı"),
+        Ok(false) => tracing::error!("SMTP sunucusu bağlantıyı kabul etmedi — email bildirimleri çalışmayacak"),
+        Err(e) => tracing::error!("SMTP bağlantı testi başarısız — email bildirimleri çalışmayacak: {}", e),
+    }
 }
 
 /// Emaili gönderir. Hata olursa loglar, panic etmez.
