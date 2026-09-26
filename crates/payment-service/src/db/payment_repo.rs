@@ -1,5 +1,5 @@
 use anyhow::Result;
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool};
 
 use super::models::PaytrPaymentRecord;
 
@@ -64,38 +64,84 @@ pub async fn find_by_oid(pool: &PgPool, merchant_oid: &str) -> Result<Option<Pay
     Ok(rec)
 }
 
-/// Atomik başarı işareti: yalnızca 'success' olmayan kayıtları günceller.
-/// İki eş zamanlı callback olduğunda sadece biri true alır; çift işlem önlenir.
-pub async fn set_success(pool: &PgPool, merchant_oid: &str) -> Result<bool> {
-    let r = sqlx::query(
-        "UPDATE paytr_payments
-         SET status = 'success', callback_received_at = NOW()
-         WHERE merchant_oid = $1 AND status != 'success'",
+/// Callback transaction'ı içinde ödeme satırını kilitler (eşzamanlı çift callback'e karşı).
+pub async fn find_by_oid_for_update<'e>(
+    ex: impl PgExecutor<'e>,
+    merchant_oid: &str,
+) -> Result<Option<PaytrPaymentRecord>> {
+    let rec = sqlx::query_as::<_, PaytrPaymentRecord>(
+        "SELECT * FROM paytr_payments WHERE merchant_oid = $1 FOR UPDATE",
     )
+    .bind(merchant_oid)
+    .fetch_optional(ex)
+    .await?;
+    Ok(rec)
+}
+
+/// Ödemeyi başarılı işaretler (callback transaction'ı içinde, satır kilitliyken).
+pub async fn set_success<'e>(ex: impl PgExecutor<'e>, merchant_oid: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE paytr_payments
+         SET status = 'success', callback_received_at = NOW(),
+             failed_reason_code = NULL, failed_reason_msg = NULL
+         WHERE merchant_oid = $1",
+    )
+    .bind(merchant_oid)
+    .execute(ex)
+    .await?;
+    Ok(())
+}
+
+/// Tutar tutarsızlığı gibi elle incelenmesi gereken ödemeler.
+pub async fn set_review(pool: &PgPool, merchant_oid: &str, reason: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE paytr_payments
+         SET status = 'review', failed_reason_msg = $1, callback_received_at = NOW()
+         WHERE merchant_oid = $2 AND status = 'pending'",
+    )
+    .bind(reason)
     .bind(merchant_oid)
     .execute(pool)
     .await?;
-    Ok(r.rows_affected() > 0)
+    Ok(())
 }
 
+/// Bekleyen ödemeyi başarısız işaretler. Yalnızca ilk bildirim etkili olur (PayTR aynı
+/// callback'i yeniden gönderebilir; scheduler sync yanıtında zaten işaretlemiş olabilir).
+/// Dönüş: güncellendiyse ödeme kaydı.
 pub async fn set_failed(
     pool: &PgPool,
     merchant_oid: &str,
     reason_code: Option<&str>,
     reason_msg: Option<&str>,
-) -> Result<()> {
-    sqlx::query(
+) -> Result<Option<PaytrPaymentRecord>> {
+    let rec = sqlx::query_as::<_, PaytrPaymentRecord>(
         "UPDATE paytr_payments
          SET status = 'failed',
              failed_reason_code = $1,
              failed_reason_msg  = $2,
              callback_received_at = NOW()
-         WHERE merchant_oid = $3",
+         WHERE merchant_oid = $3 AND status = 'pending'
+         RETURNING *",
     )
     .bind(reason_code)
     .bind(reason_msg)
     .bind(merchant_oid)
+    .fetch_optional(pool)
+    .await?;
+    Ok(rec)
+}
+
+/// Callback'i hiç gelmemiş eski bekleyen ödemeler: başarılı olsaydı PayTR callback'i
+/// (yeniden denemeleriyle) gelirdi. Aboneliğin yenilemesini sonsuza kilitlemesinler.
+pub async fn fail_stale_pending(pool: &PgPool, older_than_hours: i32) -> Result<u64> {
+    let r = sqlx::query(
+        "UPDATE paytr_payments
+         SET status = 'failed', failed_reason_msg = 'no_callback'
+         WHERE status = 'pending' AND created_at < NOW() - make_interval(hours => $1)",
+    )
+    .bind(older_than_hours)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(r.rows_affected())
 }

@@ -198,7 +198,8 @@ chmod +x /mnt/c/Dev/MyWorks/paytr_subscription/paytr-service/deploy.sh
 bash /mnt/c/Dev/MyWorks/paytr_subscription/paytr-service/deploy.sh
 ```
 
-`.env` de güncellenecekse (yeni env değişkeni eklendi vb.):
+Sunucudaki `.env` tek doğruluk kaynağıdır; deploy varsayılan olarak onu **değiştirmez**.
+Yerel `.env`'i bilerek göndermek için (sunucudaki önce `.env.bak.<zaman>` olarak yedeklenir):
 
 ```bash
 bash deploy.sh --env
@@ -206,15 +207,34 @@ bash deploy.sh --env
 
 ### deploy.sh ne yapar?
 
-1. `cargo build --release` ile binary üretir
-2. `sudo systemctl stop paytr-service` — servisi durdurur (çalışan binary üzerine yazılamaz)
-3. `scp` ile binary'yi kopyalar
-4. `sudo systemctl start paytr-service` — servisi başlatır
-5. Hata olursa bile servisi yeniden başlatmayı dener (trap)
-6. Son durumu ekrana basar
+1. `cargo test` + `cargo build --release`
+2. Binary'yi `payment-service.new` olarak yükler (çalışan binary'ye dokunmaz)
+3. Eskisini `payment-service.bak` yedekler, `mv` ile atomik değiştirir, `systemctl restart`
+4. `/health` kontrolü; başarısızsa log basar ve otomatik olarak `.bak`'a döner
 
-> **Neden önce stop?** Linux'ta çalışan bir binary'nin üzerine `scp` ile yazmak
-> "Text file busy" hatası verir. Servisi durdurup kopyalamak çözümdür.
+### Zorunlu/önemli env değişkenleri
+- `INTERNAL_API_TOKEN` (≥32 karakter): `/health` ve PayTR callback dışındaki tüm endpoint'ler
+  `X-Internal-Token` başlığı ister. qurlfrontend'de `PAYTR_SERVICE_TOKEN` ile **aynı** değer.
+- `HOST=127.0.0.1` — servis yalnızca localhost'u dinler.
+- `RUST_LOG=payment_service=info,tower_http=info,sqlx=warn`
+- `GRACE_DAYS` (varsayılan 4), `MAX_FAILED_ATTEMPTS` (varsayılan 3): yenileme günde bir denenir,
+  ödeme alınamayan abonelik bitişten `GRACE_DAYS` gün sonra expire edilir.
+- `.env` izinleri `600` olmalı (merchant key/salt içerir).
+
+### Abonelik yaşam döngüsü
+`pending → active → (cancelled →) expired`; upgrade ile yerini yenisine bırakan abonelik
+`replaced`. Scheduler saatte bir: (1) 48 saati geçmiş callback'siz pending ödemeleri `failed`
+yapar, (2) vadesi gelenleri kayıtlı kartla tahsil eder, (3) süresi dolanları expire eder,
+güncel aboneliği bitenleri Standard'a düşürür ve geçerli aboneliği kalmayan üyelerin kartlarını
+PayTR + DB'den siler (iptal anında kart silinmez; dönem sonuna kadar iptal geri alınabilir).
+DB oturumu UTC'ye sabitlenir (`SET TIME ZONE 'UTC'`); tüm tarih sütunları UTC'dir
+(bu değişiklikten önce yazılmış `created_at/updated_at/cancelled_at` değerleri Europe/Istanbul).
+
+### Testler
+```bash
+cargo test                    # unit testler
+bash scripts/e2e/run.sh       # Docker Postgres + mock PayTR ile uçtan uca (WSL)
+```
 
 ---
 
@@ -227,7 +247,7 @@ bash deploy.sh --env
 ```nginx
 # PayTR callback — sadece bu endpoint dışarıya açık
 location = /paytr/api/v1/payments/callback {
-    proxy_pass http://127.0.0.1:3002;
+    proxy_pass http://127.0.0.1:3002/api/v1/payments/callback;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
 }

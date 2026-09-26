@@ -99,15 +99,15 @@ pub fn tpl_payment_failed(
     site_url: &str,
 ) -> (&'static str, String) {
     let plan_label = plan_display(plan);
-    let reason_text = reason.unwrap_or("Banka tarafından reddedildi");
+    let reason_text = html_escape(reason.unwrap_or("Banka tarafından reddedildi"));
     let body = if attempts_left > 0 {
         format!(
-            "{}. planına ait ödemeniz başarısız oldu.<br><br>Sebep: <em>{}</em><br><br>Ödemeniz <strong>{} kez</strong> daha denlenecek. Kart bilgilerinizi güncellemek için planlar sayfasını ziyaret edebilirsiniz.",
+            "<strong>{}</strong> planınızın yenileme ödemesi alınamadı.<br><br>Sebep: <em>{}</em><br><br>Ödeme günde bir olmak üzere <strong>{} kez</strong> daha denenecek. Kartınızı güncellemek için planlar sayfasını ziyaret edebilirsiniz.",
             plan_label, reason_text, attempts_left
         )
     } else {
         format!(
-            "{}. planına ait ödemeniz <strong>birden fazla kez</strong> başarısız oldu.<br><br>Sebep: <em>{}</em><br><br>Aboneliğiniz yenilenemedi. Tekrar abone olmak için planlar sayfasını ziyaret edin.",
+            "<strong>{}</strong> planınızın yenileme ödemesi <strong>birden fazla kez</strong> alınamadı.<br><br>Sebep: <em>{}</em><br><br>Aboneliğiniz yenilenemedi. Tekrar abone olmak için planlar sayfasını ziyaret edin.",
             plan_label, reason_text
         )
     };
@@ -141,7 +141,7 @@ pub fn tpl_subscription_cancelled(
 ) -> (&'static str, String) {
     let plan_label = plan_display(plan);
     let body = format!(
-        "<strong>{}</strong> planı aboneliğiniz iptal edildi.<br><br>Aboneliğiniz <strong>{}</strong> tarihine kadar aktif kalmaya devam edecek, bu tarihten sonra standart plana geçiş yapılacaktır.",
+        "<strong>{}</strong> planı aboneliğiniz iptal edildi.<br><br>Aboneliğiniz <strong>{}</strong> tarihine kadar aktif kalmaya devam edecek, bu tarihten sonra ücretsiz plana geçilecek ve kayıtlı kartınız silinecektir. Bu tarihe kadar iptali planlar sayfasından geri alabilirsiniz.",
         plan_label, expires_at
     );
     let html = base_template(
@@ -152,12 +152,22 @@ pub fn tpl_subscription_cancelled(
     ("Aboneliğiniz iptal edildi", html)
 }
 
-fn plan_display(plan: &str) -> &str {
+fn plan_display(plan: &str) -> String {
     match plan {
-        "gold"   => "Gold",
-        "silver" => "Silver",
-        other    => other,
+        "gold"       => "Gold".to_string(),
+        "silver"     => "Silver".to_string(),
+        "enterprise" => "Enterprise".to_string(),
+        other        => html_escape(other),
     }
+}
+
+/// Şablona giren değişken metinler (PayTR hata mesajı vb.) için.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\x27', "&#39;")
 }
 
 fn base_template(heading: &str, body: &str, cta: Option<(&str, &str)>) -> String {

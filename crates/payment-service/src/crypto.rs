@@ -88,3 +88,33 @@ pub fn generate_card_delete_token(
     let data = format!("{}{}{}", ctoken, utoken, merchant_salt);
     hmac_sha256_base64(&data, merchant_key)
 }
+
+/// Uzunluk dışında sabit zamanlı bayt karşılaştırması (iç API token'ı için).
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_hash_roundtrip() {
+        let data = format!("{}{}{}{}", "u1t123", "salt", "success", "29900");
+        let good = hmac_sha256_base64(&data, "key");
+        assert!(verify_callback_hash("u1t123", "salt", "success", "29900", "key", &good));
+        assert!(!verify_callback_hash("u1t123", "salt", "success", "100", "key", &good));
+        assert!(!verify_callback_hash("u1t123", "salt", "success", "29900", "other", &good));
+        assert!(!verify_callback_hash("u1t123", "salt", "success", "29900", "key", "not base64!"));
+    }
+
+    #[test]
+    fn constant_time_eq_works() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+    }
+}

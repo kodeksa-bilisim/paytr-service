@@ -1,17 +1,19 @@
 use serde::{Deserialize, Serialize};
 
 /// Yeni kart ile ödeme + kart saklama (ilk abonelik ödemesi, 3D Secure).
+/// Next.js sunucusu `member_id`/`email`'i oturumdan doldurur; tutar ve plan burada
+/// yeniden doğrulanır (server action'lar tarayıcıdan rastgele argümanla çağrılabilir).
 #[derive(Debug, Deserialize)]
 pub struct InitPaymentRequest {
-    /// qurlbackend customers.member_id — opsiyonel, yoksa email üzerinden bulunur.
-    pub member_id: Option<i32>,
-    pub plan: String,          // gold, silver, standard
-    pub billing_cycle: String, // monthly, yearly
+    /// qurlbackend customers.member_id (zorunlu).
+    pub member_id: i32,
+    pub plan: String,          // silver, gold
+    pub billing_cycle: String, // yalnızca "monthly"
     // --- PayTR alanları ---
     pub user_ip: String,
     pub merchant_oid: String,
     pub email: String,
-    /// Kuruş cinsinden tutar (örn: 99.90 TL → "9990")
+    /// TL cinsinden tutar, iki ondalık: "149.00"
     pub payment_amount: String,
     #[serde(default = "default_payment_type")]
     pub payment_type: String,
@@ -25,40 +27,6 @@ pub struct InitPaymentRequest {
     pub user_basket: Vec<BasketItem>,
     pub merchant_ok_url: String,
     pub merchant_fail_url: String,
-    /// Mevcut kullanıcının utoken'ı varsa gönderilir (ikinci kart eklerken)
-    pub utoken: Option<String>,
-    pub card_type: Option<String>,
-    #[serde(default = "default_lang")]
-    pub client_lang: String,
-    pub debug_on: Option<u8>,
-}
-
-/// Kayıtlı kart ile abonelik ödemesi (Non-3D, server-to-server).
-#[derive(Debug, Deserialize)]
-pub struct StoredCardPaymentRequest {
-    pub member_id: i32,
-    pub subscription_id: i32,
-    pub plan: String, // gold, silver — tutar doğrulaması için
-    // --- PayTR alanları ---
-    pub user_ip: String,
-    pub merchant_oid: String,
-    pub email: String,
-    pub payment_amount: String,
-    #[serde(default = "default_payment_type")]
-    pub payment_type: String,
-    #[serde(default)]
-    pub installment_count: u8,
-    #[serde(default = "default_currency")]
-    pub currency: String,
-    pub user_name: String,
-    pub user_address: String,
-    pub user_phone: String,
-    pub user_basket: Vec<BasketItem>,
-    pub utoken: String,
-    pub ctoken: String,
-    pub require_cvv: u8,
-    /// require_cvv = 1 ise zorunlu
-    pub cvv: Option<String>,
     pub card_type: Option<String>,
     #[serde(default = "default_lang")]
     pub client_lang: String,
@@ -68,7 +36,7 @@ pub struct StoredCardPaymentRequest {
 /// Enterprise plan için fiyat hesaplayıcı isteği — fiyat backend'de hesaplanır.
 #[derive(Debug, Deserialize)]
 pub struct EnterpriseInitRequest {
-    pub member_id: Option<i32>,
+    pub member_id: i32,
     pub email: String,
     pub users: i32,
     pub extra_links: i32,
@@ -80,7 +48,6 @@ pub struct EnterpriseInitRequest {
     pub merchant_fail_url: String,
     #[serde(default = "default_lang")]
     pub client_lang: String,
-    pub utoken: Option<String>,
     pub card_type: Option<String>,
     pub debug_on: Option<u8>,
 }
@@ -89,7 +56,6 @@ pub struct EnterpriseInitRequest {
 #[derive(Debug, Deserialize)]
 pub struct ScheduleDowngradeRequest {
     pub member_id: i32,
-    pub email: String,
     pub new_plan: String, // "silver" | "standard"
 }
 
@@ -126,17 +92,6 @@ pub struct InitPaymentResponse {
     pub form_params: PaytrFormParams,
 }
 
-/// Kayıtlı kart ödemesinin anlık sonucu (sync_mode=1).
-#[derive(Debug, Serialize)]
-pub struct StoredCardPaymentResponse {
-    pub payment_id: i32,
-    pub subscription_id: i32,
-    pub merchant_oid: String,
-    /// PayTR sync yanıtı: success | failed | wait_callback
-    pub paytr_status: String,
-    pub paytr_message: Option<String>,
-}
-
 /// PayTR'a gönderilecek form parametreleri (kart verisi hariç).
 #[derive(Debug, Serialize)]
 pub struct PaytrFormParams {
@@ -161,8 +116,6 @@ pub struct PaytrFormParams {
     pub merchant_ok_url: String,
     pub merchant_fail_url: String,
     pub lang: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub utoken: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub card_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

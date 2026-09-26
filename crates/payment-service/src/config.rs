@@ -28,6 +28,11 @@ pub struct Config {
     pub scheduler_interval_secs: u64,
     /// Bu kadar başarısız ödeme denemesinden sonra abonelik yenilenmez. Varsayılan: 3.
     pub max_failed_attempts: i32,
+    /// Ödeme alınamayan aktif abonelik, bitişten bu kadar gün sonra expire edilir (yenileme
+    /// denemeleri günde bir yapılır). Varsayılan: 4.
+    pub grace_days: i32,
+    /// Next.js → servis çağrılarında `X-Internal-Token` olarak beklenen gizli değer (zorunlu).
+    pub internal_api_token: String,
     /// Email ayarları — tüm SMTP değişkenleri tanımlıysa Some, değilse None.
     pub email: Option<EmailConfig>,
 }
@@ -43,6 +48,8 @@ impl std::fmt::Debug for Config {
             .field("test_mode", &self.test_mode)
             .field("database_url", &"[REDACTED]")
             .field("base_url", &self.base_url)
+            .field("grace_days", &self.grace_days)
+            .field("internal_api_token", &"[REDACTED]")
             .finish()
     }
 }
@@ -93,6 +100,15 @@ impl Config {
                 .unwrap_or_else(|_| "3".to_string())
                 .parse()
                 .context("MAX_FAILED_ATTEMPTS geçerli bir sayı olmalıdır")?,
+            grace_days: std::env::var("GRACE_DAYS")
+                .unwrap_or_else(|_| "4".to_string())
+                .parse()
+                .context("GRACE_DAYS geçerli bir sayı olmalıdır")?,
+            internal_api_token: {
+                let t = std::env::var("INTERNAL_API_TOKEN").context("INTERNAL_API_TOKEN eksik")?;
+                anyhow::ensure!(t.len() >= 32, "INTERNAL_API_TOKEN en az 32 karakter olmalıdır");
+                t
+            },
             email: build_email_config(),
         })
     }

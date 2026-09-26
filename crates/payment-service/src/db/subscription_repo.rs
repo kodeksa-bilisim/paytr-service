@@ -1,8 +1,13 @@
 use anyhow::Result;
 use chrono::NaiveDateTime;
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool};
 
 use super::models::PaytrSubscription;
+
+// Durumlar: pending → active → (cancelled →) expired. Upgrade ile yerine yenisi geçen
+// abonelik `replaced` olur: expire/geri alma/yenileme bunu görmez (eskiden `cancelled`
+// kalıyordu; dönem sonunda kullanıcıyı Standard'a düşürüyor ya da geri almayla
+// yeniden canlanıp çift tahsilata yol açıyordu).
 
 /// Kullanıcı isteğiyle aboneliği iptal eder.
 /// Abonelik expires_at tarihine kadar aktif kalır (standart iptal davranışı).
@@ -22,15 +27,19 @@ pub async fn cancel_by_member(pool: &PgPool, subscription_id: i32, member_id: i3
     Ok(result.rows_affected() > 0)
 }
 
-/// İptal edilen aboneliği geri alır; sadece süresi dolmamış 'cancelled' abonelik için geçerlidir.
+/// İptal edilen aboneliği geri alır. Yalnızca müşterinin güncel aboneliği
+/// (`customers.subscription_id`) ve süresi dolmamışsa.
 pub async fn reactivate_by_member(pool: &PgPool, member_id: i32) -> Result<bool> {
     let result = sqlx::query(
         r#"
-        UPDATE paytr_subscriptions
+        UPDATE paytr_subscriptions s
         SET status = 'active', cancelled_at = NULL, updated_at = NOW()
-        WHERE member_id = $1
-          AND status = 'cancelled'
-          AND expires_at > NOW()
+        FROM customers c
+        WHERE c.member_id = $1
+          AND s.member_id = $1
+          AND s.id::text = c.subscription_id
+          AND s.status = 'cancelled'
+          AND s.expires_at > NOW()
         "#,
     )
     .bind(member_id)
@@ -83,20 +92,32 @@ pub async fn create(
     Ok(sub)
 }
 
-pub async fn find_by_id(pool: &PgPool, id: i32) -> Result<Option<PaytrSubscription>> {
+pub async fn find_by_id<'e>(ex: impl PgExecutor<'e>, id: i32) -> Result<Option<PaytrSubscription>> {
     let sub = sqlx::query_as::<_, PaytrSubscription>(
         "SELECT * FROM paytr_subscriptions WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(ex)
     .await?;
     Ok(sub)
 }
 
-#[allow(dead_code)]
+/// Callback transaction'ı içinde satırı kilitler.
+pub async fn find_by_id_for_update<'e>(ex: impl PgExecutor<'e>, id: i32) -> Result<Option<PaytrSubscription>> {
+    let sub = sqlx::query_as::<_, PaytrSubscription>(
+        "SELECT * FROM paytr_subscriptions WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(ex)
+    .await?;
+    Ok(sub)
+}
+
+/// Üyenin aktif aboneliği (birden fazlaysa en yenisi).
 pub async fn find_active(pool: &PgPool, member_id: i32) -> Result<Option<PaytrSubscription>> {
     let sub = sqlx::query_as::<_, PaytrSubscription>(
-        "SELECT * FROM paytr_subscriptions WHERE member_id = $1 AND status = 'active' LIMIT 1",
+        "SELECT * FROM paytr_subscriptions WHERE member_id = $1 AND status = 'active'
+         ORDER BY id DESC LIMIT 1",
     )
     .bind(member_id)
     .fetch_optional(pool)
@@ -104,27 +125,47 @@ pub async fn find_active(pool: &PgPool, member_id: i32) -> Result<Option<PaytrSu
     Ok(sub)
 }
 
-/// pending → active: ilk başarılı ödeme sonrası çağrılır.
-pub async fn activate(
-    pool: &PgPool,
+/// Üyenin hâlâ geçerli (aktif ya da süresi dolmamış iptal) bir aboneliği var mı?
+pub async fn has_live_subscription(pool: &PgPool, member_id: i32) -> Result<bool> {
+    let exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM paytr_subscriptions
+            WHERE member_id = $1
+              AND (status = 'active' OR (status = 'cancelled' AND expires_at > NOW()))
+        )
+        "#,
+    )
+    .bind(member_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
+}
+
+/// İlk başarılı ödeme: aktifleştirir. Hiç aktif olmamış (started_at NULL) abonelik
+/// için geçerlidir — kullanıcı yeni bir ödeme başlatınca `cancel_pending` ile iptal
+/// edilmiş eski pending abonelik de, o ödeme tamamlanırsa aktifleşir.
+pub async fn activate<'e>(
+    ex: impl PgExecutor<'e>,
     id: i32,
     utoken: &str,
     ctoken: &str,
     started_at: NaiveDateTime,
     expires_at: NaiveDateTime,
     next_payment_date: NaiveDateTime,
-) -> Result<()> {
-    sqlx::query(
+) -> Result<bool> {
+    let r = sqlx::query(
         r#"
         UPDATE paytr_subscriptions
         SET status            = 'active',
-            utoken            = $1,
-            ctoken            = $2,
+            utoken            = NULLIF($1, ''),
+            ctoken            = NULLIF($2, ''),
             started_at        = $3,
             expires_at        = $4,
             next_payment_date = $5,
+            cancelled_at      = NULL,
             updated_at        = NOW()
-        WHERE id = $6 AND status = 'pending'
+        WHERE id = $6 AND started_at IS NULL
         "#,
     )
     .bind(utoken)
@@ -133,38 +174,49 @@ pub async fn activate(
     .bind(expires_at)
     .bind(next_payment_date)
     .bind(id)
-    .execute(pool)
+    .execute(ex)
     .await?;
-    Ok(())
+    Ok(r.rows_affected() > 0)
 }
 
-/// Aboneliği yeniler: expires_at ve next_payment_date güncellenir.
-pub async fn renew(
-    pool: &PgPool,
+/// Aboneliği yeniler: expires_at ve next_payment_date güncellenir. Tahsilat callback'i
+/// grace süresi dolduktan sonra gelirse (abonelik expired) yeniden aktifleşir; iptal
+/// edilmişse iptal kalır (yeni dönem biter, sonrası yenilenmez).
+pub async fn renew<'e>(
+    ex: impl PgExecutor<'e>,
     id: i32,
+    plan: Option<&str>,
     expires_at: NaiveDateTime,
     next_payment_date: NaiveDateTime,
 ) -> Result<()> {
     sqlx::query(
         r#"
         UPDATE paytr_subscriptions
-        SET expires_at        = $1,
-            next_payment_date = $2,
+        SET plan              = COALESCE($1, plan),
+            scheduled_plan    = CASE WHEN $1 IS NULL THEN scheduled_plan ELSE NULL END,
+            scheduled_amount  = CASE WHEN $1 IS NULL THEN scheduled_amount ELSE NULL END,
+            amount            = CASE WHEN $1 IS NULL THEN amount ELSE COALESCE(scheduled_amount, amount) END,
+            status            = CASE WHEN status = 'expired' THEN 'active' ELSE status END,
+            expires_at        = $2,
+            next_payment_date = $3,
+            renewal_attempts  = 0,
+            last_renewal_attempt_at = NULL,
             updated_at        = NOW()
-        WHERE id = $3
+        WHERE id = $4
         "#,
     )
+    .bind(plan)
     .bind(expires_at)
     .bind(next_payment_date)
     .bind(id)
-    .execute(pool)
+    .execute(ex)
     .await?;
     Ok(())
 }
 
-/// Scheduler'ın işleyeceği vadesi gelen aktif abonelikleri döner.
+/// Scheduler'ın işleyeceği vadesi gelen aktif abonelikler.
 /// require_cvv=TRUE olan kartlar dahil edilmez (CVV olmadan ödeme yapılamaz).
-/// 3+ başarısız denemesi olan müşteriler hariç tutulur.
+/// Denemeler günde bir yapılır; `max_failed_attempts` başarısız denemeden sonra durur.
 #[derive(Debug, sqlx::FromRow)]
 #[allow(dead_code)]
 pub struct DueSubscription {
@@ -172,7 +224,7 @@ pub struct DueSubscription {
     pub member_id: i32,
     pub plan: String,           // Efektif plan (COALESCE ile scheduled_plan öncelikli)
     pub billing_cycle: String,
-    pub amount: String,         // Efektif tutar
+    pub amount: String,         // Efektif tutar (TL, "149.00")
     pub currency: String,
     pub utoken: String,
     pub ctoken: String,
@@ -208,7 +260,9 @@ pub async fn query_due(pool: &PgPool, max_failed_attempts: i32) -> Result<Vec<Du
           AND s.utoken IS NOT NULL
           AND s.ctoken IS NOT NULL
           AND c.require_cvv = FALSE
-          AND COALESCE(cu.failed_payment_attempts, 0) < $1
+          AND s.renewal_attempts < $1
+          AND (s.last_renewal_attempt_at IS NULL OR s.last_renewal_attempt_at < NOW() - INTERVAL '1 day')
+        ORDER BY s.next_payment_date
         "#,
     )
     .bind(max_failed_attempts)
@@ -217,29 +271,10 @@ pub async fn query_due(pool: &PgPool, max_failed_attempts: i32) -> Result<Vec<Du
     Ok(rows)
 }
 
-/// Süresi dolmuş ama hâlâ 'active' veya 'cancelled' olan abonelikleri 'expired' yapar.
-/// Scheduler tarafından çağrılır; dönen liste customer_repo::set_subscription_expired için kullanılır.
-pub async fn mark_expired(pool: &PgPool) -> Result<Vec<i32>> {
-    let member_ids: Vec<i32> = sqlx::query_scalar(
-        r#"
-        UPDATE paytr_subscriptions
-        SET status = 'expired', updated_at = NOW()
-        WHERE status IN ('active', 'cancelled')
-          AND expires_at < NOW()
-        RETURNING member_id
-        "#,
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(member_ids)
-}
-
-/// Başarısız yenileme denemesini sayar.
-pub async fn increment_renewal_attempts(pool: &PgPool, subscription_id: i32) -> Result<()> {
+/// Yenileme denemesi başladı: aynı gün tekrar denenmez.
+pub async fn mark_renewal_attempt(pool: &PgPool, subscription_id: i32) -> Result<()> {
     sqlx::query(
-        "UPDATE paytr_subscriptions
-         SET renewal_attempts = renewal_attempts + 1, updated_at = NOW()
-         WHERE id = $1",
+        "UPDATE paytr_subscriptions SET last_renewal_attempt_at = NOW(), updated_at = NOW() WHERE id = $1",
     )
     .bind(subscription_id)
     .execute(pool)
@@ -247,11 +282,37 @@ pub async fn increment_renewal_attempts(pool: &PgPool, subscription_id: i32) -> 
     Ok(())
 }
 
-/// Ödeme başarısından sonra renewal_attempts sıfırla.
-pub async fn reset_renewal_attempts(pool: &PgPool, subscription_id: i32) -> Result<()> {
+/// Süresi dolmuş abonelikleri 'expired' yapar ve (id, member_id) döner.
+/// - `cancelled`: expires_at geçince.
+/// - `active`: ancak expires_at + `grace_days` geçince (yenileme denemeleri için süre) ve
+///   bekleyen bir ödemesi yoksa.
+pub async fn mark_expired(pool: &PgPool, grace_days: i32) -> Result<Vec<(i32, i32)>> {
+    let rows: Vec<(i32, i32)> = sqlx::query_as(
+        r#"
+        UPDATE paytr_subscriptions s
+        SET status = 'expired', updated_at = NOW()
+        WHERE (
+                (s.status = 'cancelled' AND s.expires_at < NOW())
+             OR (s.status = 'active'    AND s.expires_at < NOW() - make_interval(days => $1))
+              )
+          AND NOT EXISTS (
+                SELECT 1 FROM paytr_payments p
+                WHERE p.subscription_id = s.id AND p.status = 'pending'
+              )
+        RETURNING s.id, s.member_id
+        "#,
+    )
+    .bind(grace_days)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Başarısız yenileme denemesini sayar.
+pub async fn increment_renewal_attempts(pool: &PgPool, subscription_id: i32) -> Result<()> {
     sqlx::query(
         "UPDATE paytr_subscriptions
-         SET renewal_attempts = 0, updated_at = NOW()
+         SET renewal_attempts = renewal_attempts + 1, updated_at = NOW()
          WHERE id = $1",
     )
     .bind(subscription_id)
@@ -291,63 +352,22 @@ pub async fn cancel_scheduled(pool: &PgPool, subscription_id: i32) -> Result<()>
     Ok(())
 }
 
-/// Yenileme + plan değişikliği: scheduled_plan/amount temizlenir, plan güncellenir.
-pub async fn renew_with_plan(
-    pool: &PgPool,
-    id: i32,
-    plan: &str,
-    expires_at: NaiveDateTime,
-    next_payment_date: NaiveDateTime,
-) -> Result<()> {
+/// Upgrade: yeni abonelik aktifleşince üyenin diğer aktif/iptal edilmiş aboneliklerini
+/// `replaced` yapar; diğer pending abonelikleri iptal eder.
+pub async fn replace_others<'e>(ex: impl PgExecutor<'e>, member_id: i32, keep_id: i32) -> Result<()> {
     sqlx::query(
         r#"
         UPDATE paytr_subscriptions
-        SET plan              = $1,
-            expires_at        = $2,
-            next_payment_date = $3,
-            scheduled_plan    = NULL,
-            scheduled_amount  = NULL,
-            updated_at        = NOW()
-        WHERE id = $4
-        "#,
-    )
-    .bind(plan)
-    .bind(expires_at)
-    .bind(next_payment_date)
-    .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Plan değişikliğinde (upgrade/downgrade) yeni abonelik aktifleştikten sonra
-/// aynı kullanıcının diğer tüm aktif aboneliklerini iptal eder.
-pub async fn cancel_active_except(pool: &PgPool, member_id: i32, keep_id: i32) -> Result<()> {
-    sqlx::query(
-        r#"
-        UPDATE paytr_subscriptions
-        SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()
-        WHERE member_id = $1 AND id != $2 AND status = 'active'
+        SET status = CASE WHEN status = 'pending' THEN 'cancelled' ELSE 'replaced' END,
+            cancelled_at = COALESCE(cancelled_at, NOW()),
+            updated_at = NOW()
+        WHERE member_id = $1 AND id != $2 AND status IN ('active', 'cancelled', 'pending')
+          AND NOT (status = 'cancelled' AND started_at IS NULL)
         "#,
     )
     .bind(member_id)
     .bind(keep_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-#[allow(dead_code)]
-pub async fn cancel(pool: &PgPool, member_id: i32) -> Result<()> {
-    sqlx::query(
-        r#"
-        UPDATE paytr_subscriptions
-        SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()
-        WHERE member_id = $1 AND status = 'active'
-        "#,
-    )
-    .bind(member_id)
-    .execute(pool)
+    .execute(ex)
     .await?;
     Ok(())
 }

@@ -3,13 +3,17 @@ use std::time::Duration;
 use chrono::Utc;
 
 use crate::{
+    cards,
     crypto::generate_payment_token,
     db::{customer_repo, payment_repo, subscription_repo},
     db::subscription_repo::DueSubscription,
     email,
-    paytr_client::PAYTR_PAYMENT_ENDPOINT,
+    paytr_client,
     AppState,
 };
+
+/// Callback'i gelmemiş pending ödemeler bu kadar saat sonra `failed (no_callback)` olur.
+const STALE_PENDING_HOURS: i32 = 48;
 
 /// Scheduler'ı arka planda başlatır. Servis ayakta olduğu sürece döngü çalışır.
 pub fn start(state: AppState) {
@@ -17,7 +21,12 @@ pub fn start(state: AppState) {
 
     tokio::spawn(async move {
         // Servis başlangıcında kısa bekleme — migration ve bağlantının oturması için.
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        // (SCHEDULER_START_DELAY_SECS: e2e testlerinde kısaltmak için.)
+        let start_delay = std::env::var("SCHEDULER_START_DELAY_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        tokio::time::sleep(Duration::from_secs(start_delay)).await;
 
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -33,9 +42,15 @@ pub fn start(state: AppState) {
     });
 }
 
-async fn process_due(state: &AppState) -> anyhow::Result<()> {
-    // Süresi dolmuş abonelikleri 'expired' yap ve kullanıcıları Standard'a düşür
-    expire_subscriptions(state).await?;
+/// Sıra önemli: önce vadesi gelenler tahsil edilir, sonra süresi dolanlar expire edilir.
+/// (Eskiden önce expire çalışıyordu; `next_payment_date == expires_at` olduğundan vadesi
+/// gelen abonelik tahsil edilmeden expired oluyor, otomatik yenileme hiç çalışmıyordu.)
+pub async fn process_due(state: &AppState) -> anyhow::Result<()> {
+    match payment_repo::fail_stale_pending(&state.db, STALE_PENDING_HOURS).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(count = n, "Callback'i gelmeyen eski pending ödemeler failed işaretlendi"),
+        Err(e) => tracing::error!("Eski pending ödemeler temizlenemedi: {:?}", e),
+    }
 
     // CVV gerektiren ve vadesi gelen kartlara email gönder (otomatik çekilemiyor)
     notify_cvv_required(state).await;
@@ -44,12 +59,17 @@ async fn process_due(state: &AppState) -> anyhow::Result<()> {
 
     if due.is_empty() {
         tracing::debug!("Vadesi gelen abonelik yok");
-        return Ok(());
+    } else {
+        tracing::info!(count = due.len(), "Vadesi gelen abonelikler işleniyor");
     }
 
-    tracing::info!(count = due.len(), "Vadesi gelen abonelikler işleniyor");
-
     for sub in &due {
+        // Deneme zamanı önce yazılır: PayTR'a ulaşılamasa bile aynı gün tekrar denenmez.
+        if let Err(e) = subscription_repo::mark_renewal_attempt(&state.db, sub.subscription_id).await {
+            tracing::error!(subscription_id = sub.subscription_id, "Deneme zamanı yazılamadı, atlandı: {:?}", e);
+            continue;
+        }
+
         match charge(state, sub).await {
             Ok(()) => {
                 tracing::info!(
@@ -67,15 +87,18 @@ async fn process_due(state: &AppState) -> anyhow::Result<()> {
                 let _ = subscription_repo::increment_renewal_attempts(&state.db, sub.subscription_id).await;
                 let _ = customer_repo::increment_failed_attempts(&state.db, sub.member_id).await;
 
-                // Başarısız ödeme email bildirimi callback'ten gelir.
-                // Scheduler hatasında (PayTR'a ulaşılamadı vb.) da bildir.
                 if let (Some(mailer), Some(email_cfg)) = (&state.mailer, &state.config.email) {
                     let to = sub.user_email.as_str();
                     if !to.is_empty() {
+                        let remaining = match subscription_repo::find_by_id(&state.db, sub.subscription_id).await {
+                            Ok(Some(s)) => (state.config.max_failed_attempts - s.renewal_attempts).max(0),
+                            _ => 0,
+                        };
+                        // Kullanıcıya iç hata ayrıntısı gönderilmez.
                         let (subject, html) = email::tpl_payment_failed(
                             &sub.plan,
-                            Some(&e.to_string()),
-                            state.config.max_failed_attempts - 1,
+                            None,
+                            remaining,
                             &email_cfg.site_url,
                         );
                         email::send(mailer, email_cfg, to, subject, html).await;
@@ -85,31 +108,42 @@ async fn process_due(state: &AppState) -> anyhow::Result<()> {
         }
     }
 
+    // Süresi dolmuş abonelikleri 'expired' yap, kullanıcıları Standard'a düşür, kartları sil.
+    expire_subscriptions(state).await?;
+
     Ok(())
 }
 
-/// Süresi dolmuş abonelikleri 'expired' olarak işaretler ve
-/// customers tablosunda user_type'ı 'Standard'a düşürür.
+/// Süresi dolmuş abonelikleri `expired` yapar; güncel aboneliği bitenleri Standard'a
+/// düşürür; geçerli aboneliği kalmayan üyelerin kayıtlı kartlarını siler (iptalde kart
+/// silinmiyor, dönem sonuna kadar geri alma için tutuluyor).
 async fn expire_subscriptions(state: &AppState) -> anyhow::Result<()> {
-    let expired_member_ids = subscription_repo::mark_expired(&state.db).await?;
-    if expired_member_ids.is_empty() {
+    let expired = subscription_repo::mark_expired(&state.db, state.config.grace_days).await?;
+    if expired.is_empty() {
         return Ok(());
     }
 
-    tracing::info!(count = expired_member_ids.len(), "Süresi dolmuş abonelikler işleniyor");
+    tracing::info!(count = expired.len(), "Süresi dolmuş abonelikler işleniyor");
 
-    for member_id in expired_member_ids {
-        if let Err(e) = customer_repo::set_subscription_expired(&state.db, member_id).await {
-            tracing::error!(member_id, "Expired downgrade hatası: {:?}", e);
-        } else {
-            tracing::info!(member_id, "Kullanıcı Standard'a düşürüldü");
+    for (subscription_id, member_id) in expired {
+        match customer_repo::set_subscription_expired(&state.db, member_id, subscription_id).await {
+            Ok(true) => tracing::info!(member_id, subscription_id, "Kullanıcı Standard'a düşürüldü"),
+            Ok(false) => tracing::info!(member_id, subscription_id, "Güncel abonelik değil, kullanıcı planı korunuyor"),
+            Err(e) => tracing::error!(member_id, subscription_id, "Expired downgrade hatası: {:?}", e),
+        }
+
+        match subscription_repo::has_live_subscription(&state.db, member_id).await {
+            Ok(false) => cards::delete_member_cards(state, member_id).await,
+            Ok(true) => {}
+            Err(e) => tracing::error!(member_id, "Abonelik kontrolü başarısız, kart silme atlandı: {:?}", e),
         }
     }
 
     Ok(())
 }
 
-/// CVV gerektiren aktif aboneliklerin sahiplerine email gönderir.
+/// CVV gerektiren (otomatik çekilemeyen) vadesi gelmiş aboneliklerin sahiplerine günde
+/// bir email gönderir.
 async fn notify_cvv_required(state: &AppState) {
     let (Some(mailer), Some(email_cfg)) = (&state.mailer, &state.config.email) else {
         return;
@@ -117,19 +151,21 @@ async fn notify_cvv_required(state: &AppState) {
 
     #[derive(sqlx::FromRow)]
     struct CvvRow {
+        id: i32,
         plan: String,
         email: String,
     }
 
     let rows = sqlx::query_as::<_, CvvRow>(
         r#"
-        SELECT s.plan, COALESCE(s.user_email, cu.email, '') AS email
+        SELECT s.id, s.plan, COALESCE(s.user_email, cu.email, '') AS email
         FROM paytr_subscriptions s
         JOIN paytr_cards c ON c.ctoken = s.ctoken AND c.is_active = TRUE
         JOIN customers cu ON cu.member_id = s.member_id
         WHERE s.status = 'active'
           AND s.next_payment_date <= NOW()
           AND c.require_cvv = TRUE
+          AND (s.last_renewal_attempt_at IS NULL OR s.last_renewal_attempt_at < NOW() - INTERVAL '1 day')
         "#,
     )
     .fetch_all(&state.db)
@@ -139,12 +175,18 @@ async fn notify_cvv_required(state: &AppState) {
         Err(e) => tracing::error!("CVV sorgulama hatası: {:?}", e),
         Ok(rows) => {
             for row in rows {
+                let _ = subscription_repo::mark_renewal_attempt(&state.db, row.id).await;
                 if row.email.is_empty() { continue; }
                 let (subject, html) = email::tpl_cvv_required(&row.plan, &email_cfg.site_url);
                 email::send(mailer, email_cfg, &row.email, subject, html).await;
             }
         }
     }
+}
+
+/// PayTR merchant_oid yalnızca harf ve rakam içerebilir.
+fn renewal_merchant_oid(subscription_id: i32, now_ms: i64) -> String {
+    format!("r{}t{}", subscription_id, now_ms)
 }
 
 async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
@@ -159,7 +201,7 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
 
     let phone = if sub.user_phone.is_empty() { "5305861333" } else { sub.user_phone.as_str() };
 
-    let merchant_oid = format!("r{}_{}", sub.subscription_id, Utc::now().timestamp_millis());
+    let merchant_oid = renewal_merchant_oid(sub.subscription_id, Utc::now().timestamp_millis());
     let test_mode_str = state.config.test_mode.to_string();
 
     let paytr_token = generate_payment_token(
@@ -221,20 +263,35 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
         ("user_basket",       basket.as_str()),
         ("merchant_ok_url",   ok_url.as_str()),
         ("merchant_fail_url", fail_url.as_str()),
-        ("client_lang",       "tr"),
+        ("lang",              "tr"),
         ("sync_mode",         "1"),
     ];
 
-    let resp: serde_json::Value = state
-        .http
-        .post(PAYTR_PAYMENT_ENDPOINT)
-        .form(&form)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("PayTR bağlantı hatası: {}", e))?
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("PayTR yanıt parse hatası: {}", e))?;
+    let resp: serde_json::Value = match async {
+        state
+            .http
+            .post(paytr_client::payment_endpoint())
+            .form(&form)
+            .send()
+            .await?
+            .json::<serde_json::Value>()
+            .await
+    }
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            // PayTR'a ulaşılamadı / yanıt okunamadı: ödeme durumu bilinmiyor. Başarısız
+            // sayılmaz, kullanıcıya bildirim gitmez; ödeme pending bırakılır — başarılıysa
+            // callback gelir, gelmezse 48 saat sonra failed olur ve yeniden denenir.
+            tracing::error!(
+                subscription_id = sub.subscription_id,
+                merchant_oid = %merchant_oid,
+                "PayTR yanıtı alınamadı, ödeme pending bırakıldı: {}", e
+            );
+            return Ok(());
+        }
+    };
 
     let status = resp
         .get("status")
@@ -248,40 +305,62 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
         "PayTR sync yanıtı"
     );
 
-    if status != "success" {
-        let reason = resp
-            .get("err_msg")
-            .or_else(|| resp.get("failed_reason_msg"))
-            .and_then(|v| v.as_str());
+    match status {
+        // Kesin sonuç callback ile gelir; abonelik/müşteri tablosu yalnızca orada güncellenir.
+        "success" | "wait_callback" => Ok(()),
+        _ => {
+            let reason = resp
+                .get("err_msg")
+                .or_else(|| resp.get("failed_reason_msg"))
+                .or_else(|| resp.get("reason"))
+                .and_then(|v| v.as_str());
 
-        // Ödeme başarısız: DB'yi güncelle (callback gelmeyebilir)
-        payment_repo::set_failed(&state.db, &merchant_oid, None, reason).await?;
+            // Ödeme başarısız: DB'yi güncelle (callback gelmeyebilir; gelirse ikinci kez sayılmaz)
+            payment_repo::set_failed(&state.db, &merchant_oid, None, reason).await?;
 
-        return Err(anyhow::anyhow!(
-            "Ödeme reddedildi: {}",
-            reason.unwrap_or("bilinmeyen hata")
-        ));
+            Err(anyhow::anyhow!(
+                "Ödeme reddedildi: {}",
+                reason.unwrap_or("bilinmeyen hata")
+            ))
+        }
     }
-
-    // Başarılı: PayTR callback'i gelince callback handler devralır.
-    // Burada subscription/customer tablosu güncellenmez — tek kaynak callback'tir.
-    Ok(())
 }
 
-/// PayTR sepet formatı: JSON.stringify([["Plan Adı", "Fiyat", 1]])
-fn build_basket(plan: &str, amount_kurus: &str) -> anyhow::Result<String> {
+/// PayTR sepet formatı: JSON.stringify([["Plan Adı", "Fiyat", 1]]). Tutar zaten TL ("149.00").
+fn build_basket(plan: &str, amount_tl: &str) -> anyhow::Result<String> {
     let label = match plan {
-        "gold"   => "Gold Plan Aboneliği",
-        "silver" => "Silver Plan Aboneliği",
-        other    => other,
+        "gold"       => "Gold Plan Aboneliği",
+        "silver"     => "Silver Plan Aboneliği",
+        "enterprise" => "Enterprise Plan Aboneliği",
+        other        => other,
     };
-    let amount_tl = amount_kurus
+    let amount = amount_tl
+        .trim()
         .parse::<f64>()
-        .map_err(|_| anyhow::anyhow!("Geçersiz tutar formatı: {}", amount_kurus))?;
-    let price = format!("{:.2}", amount_tl / 100.0);
+        .map_err(|_| anyhow::anyhow!("Geçersiz tutar formatı: {}", amount_tl))?;
+    let price = format!("{:.2}", amount);
     Ok(serde_json::to_string(&vec![[
         serde_json::Value::String(label.to_string()),
         serde_json::Value::String(price),
         serde_json::Value::Number(1.into()),
     ]])?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merchant_oid_is_alphanumeric() {
+        let oid = renewal_merchant_oid(41, 1_790_000_000_123);
+        assert_eq!(oid, "r41t1790000000123");
+        assert!(oid.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn basket_price_is_tl_amount() {
+        assert_eq!(build_basket("gold", "299.00").unwrap(), r#"[["Gold Plan Aboneliği","299.00",1]]"#);
+        assert_eq!(build_basket("enterprise", "101099.00").unwrap(), r#"[["Enterprise Plan Aboneliği","101099.00",1]]"#);
+        assert!(build_basket("gold", "abc").is_err());
+    }
 }

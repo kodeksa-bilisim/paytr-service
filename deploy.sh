@@ -1,70 +1,65 @@
 #!/usr/bin/env bash
-# PayTR Service — Deploy Script
-# Çalıştır: bash deploy.sh [--env]
-# --env bayrağı .env dosyasını da sunucuya gönderir.
+# PayTR Service — Deploy (WSL'den çalıştır): bash deploy.sh [--env]
+#   --env : yerel .env'i de gönderir (sunucudaki önce .env.bak.<zaman> olarak yedeklenir).
+#           Varsayılan: .env GÖNDERİLMEZ — sunucudaki .env tek doğruluk kaynağıdır.
+# Adımlar: test → release build → binary .new olarak yükle → .bak yedek → atomik değiştir →
+# restart → sağlık kontrolü; başarısızsa otomatik eski binary'ye döner.
 
 set -euo pipefail
 
-PROJECT_DIR="/mnt/c/Dev/MyWorks/paytr_subscription/paytr-service"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINARY="target/release/payment-service"
 REMOTE_HOST="nlink"
 REMOTE_DIR="/opt/paytr-service"
-REMOTE_BIN="$REMOTE_DIR/payment-service"
 SERVICE="paytr-service"
-SEND_ENV=true
+SEND_ENV=false
 
 for arg in "$@"; do
   [[ "$arg" == "--env" ]] && SEND_ENV=true
 done
 
-# Renk çıktısı
 ok()   { echo -e "\033[32m✓ $*\033[0m"; }
 info() { echo -e "\033[34m→ $*\033[0m"; }
 err()  { echo -e "\033[31m✗ $*\033[0m" >&2; }
 
-# Servis hata sonrası bile yeniden başlatılsın
-cleanup() {
-  if [[ $? -ne 0 ]]; then
-    err "Hata oluştu — servisi yeniden başlatmayı deniyorum..."
-    ssh -t "$REMOTE_HOST" "sudo systemctl start $SERVICE" 2>/dev/null || true
-  fi
-}
-trap cleanup EXIT
-
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 cd "$PROJECT_DIR"
 
-# --- 1. Build ---
+info "Testler çalıştırılıyor..."
+cargo test -q
 info "Release binary build ediliyor..."
 cargo build --release
 ok "Build tamamlandı → $BINARY"
 
-# --- 2. .env gönder (isteğe bağlı) ---
 if [[ "$SEND_ENV" == true ]]; then
-  info ".env sunucuya gönderiliyor (localhost:5433 → 5432 dönüşümü)..."
+  info ".env gönderiliyor (sunucudaki yedekleniyor)..."
+  ssh "$REMOTE_HOST" "cp $REMOTE_DIR/.env $REMOTE_DIR/.env.bak.\$(date +%Y%m%d%H%M%S)"
   sed 's/localhost:5433/localhost:5432/' "$PROJECT_DIR/.env" | \
-    ssh "$REMOTE_HOST" "cat > $REMOTE_DIR/.env"
-  ok ".env güncellendi"
+    ssh "$REMOTE_HOST" "umask 077 && cat > $REMOTE_DIR/.env && chmod 600 $REMOTE_DIR/.env"
+  ok ".env güncellendi (chmod 600)"
 fi
 
-# --- 3. Servisi durdur ---
-info "Sunucuda $SERVICE durduruluyor..."
-# -t: pseudo-TTY açar, sudo şifre sorarsa girilmesine izin verir
-ssh -t "$REMOTE_HOST" "sudo systemctl stop $SERVICE"
-ok "Servis durduruldu"
+info "Binary yükleniyor..."
+scp -q "$BINARY" "$REMOTE_HOST:$REMOTE_DIR/payment-service.new"
 
-# --- 4. Binary kopyala ---
-info "Binary kopyalanıyor..."
-scp "$BINARY" "$REMOTE_HOST:$REMOTE_BIN"
-ok "Binary gönderildi → $REMOTE_HOST:$REMOTE_BIN"
-
-# --- 5. Servisi başlat ---
-info "Servis başlatılıyor..."
-ssh -t "$REMOTE_HOST" "sudo systemctl start $SERVICE"
-ok "Servis başlatıldı"
-
-# --- 6. Durum ---
-echo ""
-ssh -t "$REMOTE_HOST" "sudo systemctl status $SERVICE --no-pager -l"
-
-echo ""
+info "Servis güncelleniyor..."
+ssh "$REMOTE_HOST" bash -s <<REMOTE
+set -euo pipefail
+cd $REMOTE_DIR
+cp payment-service payment-service.bak
+chmod +x payment-service.new
+mv payment-service.new payment-service
+sudo systemctl restart $SERVICE
+sleep 3
+PORT=\$(grep -E '^PORT=' .env | cut -d= -f2 | tr -d '\r')
+if systemctl is-active --quiet $SERVICE && curl -fsS "http://127.0.0.1:\${PORT:-3002}/health" >/dev/null; then
+  echo "Servis sağlıklı."
+else
+  echo "HATA: servis sağlıksız — eski binary'ye dönülüyor"
+  journalctl -u $SERVICE -n 30 --no-pager || true
+  cp payment-service.bak payment-service
+  sudo systemctl restart $SERVICE
+  exit 1
+fi
+REMOTE
 ok "Deploy tamamlandı."

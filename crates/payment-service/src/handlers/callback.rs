@@ -10,7 +10,7 @@ use crate::{
         callback::{CallbackPayload, PaymentStatus},
         card::CardItem,
     },
-    paytr_client::PAYTR_CARD_LIST_ENDPOINT,
+    paytr_client,
     AppState,
 };
 
@@ -47,10 +47,24 @@ pub async fn payment_callback(
     Ok("OK")
 }
 
+/// Kayıtlı TL tutarını kuruşa çevirir ("149.00" → 14900). Eski (noktasız) kayıtlar
+/// kuruş kabul edilir.
+fn amount_to_kurus(amount: &str) -> Option<i64> {
+    let a = amount.trim();
+    match a.split_once('.') {
+        Some((tl, kr)) if !kr.is_empty() && kr.len() <= 2 => {
+            let tl: i64 = tl.parse().ok()?;
+            let kr: i64 = format!("{:0<2}", kr).parse().ok()?;
+            Some(tl * 100 + kr)
+        }
+        Some(_) => None,
+        None => a.parse().ok(),
+    }
+}
+
 async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Result<(), AppError> {
-    // Ödeme kaydını çek
     // "Bulunamadı" durumunda OK döndür — PayTR'nin yeniden denemesi bu durumu düzeltemez.
-    // Gerçek DB hatalarında ise Err döner, PayTR yeniden dener (geçici hata kurtarma).
+    // Gerçek DB hatalarında Err döner, PayTR yeniden dener (geçici hata kurtarma).
     let Some(payment) = payment_repo::find_by_oid(&state.db, &payload.merchant_oid)
         .await
         .map_err(anyhow::Error::from)?
@@ -58,69 +72,104 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
         tracing::warn!(merchant_oid = %payload.merchant_oid, "Callback geldi fakat ödeme kaydı bulunamadı — görmezden geliniyor");
         return Ok(());
     };
-
-    // Çift callback koruması: payment success VE subscription aktifse tekrar işleme.
-    // payment=success ama subscription=pending durumunda (örn. kart parse hatası sonrası)
-    // abonelik aktivasyonuna devam et.
     if payment.status == "success" {
-        let sub_already_active = match payment.subscription_id {
-            None => true,
-            Some(sub_id) => subscription_repo::find_by_id(&state.db, sub_id)
+        tracing::info!(merchant_oid = %payload.merchant_oid, "Tekrar callback, zaten işlendi");
+        return Ok(());
+    }
+
+    // Savunma derinliği: tahsil edilen tutar (kuruş, taksit farkı dahil) beklenenden az olamaz.
+    match (amount_to_kurus(&payment.amount), payload.total_amount.trim().parse::<i64>()) {
+        (Some(expected), Ok(paid)) if paid < expected => {
+            tracing::error!(
+                merchant_oid = %payload.merchant_oid, expected, paid,
+                "Tahsil edilen tutar beklenenden düşük — aktivasyon yapılmadı, inceleme gerekli"
+            );
+            payment_repo::set_review(&state.db, &payload.merchant_oid, "amount_mismatch")
                 .await
-                .map_err(anyhow::Error::from)?
-                .map(|s| s.status != "pending")
-                .unwrap_or(true),
-        };
-        if sub_already_active {
-            tracing::warn!(merchant_oid = %payload.merchant_oid, "Tekrar callback, zaten işlendi");
+                .map_err(anyhow::Error::from)?;
             return Ok(());
         }
-        tracing::warn!(
+        (Some(_), Ok(_)) => {}
+        _ => tracing::warn!(
             merchant_oid = %payload.merchant_oid,
-            "Ödeme başarılı ama abonelik hâlâ pending, aktivasyon yeniden deneniyor"
-        );
+            amount = %payment.amount, total_amount = %payload.total_amount,
+            "Tutar karşılaştırılamadı"
+        ),
     }
 
     let member_id = payment.member_id;
 
-    // 4. Yeni utoken geldiyse (ilk kart saklama) — kart listesini çek ve DB'ye yaz
-    let active_utoken: Option<String> = if let Some(ref utoken) = payload.utoken {
-        card_repo::upsert_user_token(&state.db, member_id, utoken)
-            .await
-            .map_err(anyhow::Error::from)?;
-
-        let cards = fetch_paytr_cards(state, utoken).await?;
-        card_repo::sync_cards(&state.db, utoken, &cards)
-            .await
-            .map_err(anyhow::Error::from)?;
-
-        tracing::info!(member_id, utoken = %utoken, cards = cards.len(), "Kart listesi senkronize edildi");
-        Some(utoken.clone())
-    } else {
-        // Mevcut utoken'ı bul (renewal için)
-        card_repo::get_user_token(&state.db, member_id)
+    // Kart senkronizasyonu (PayTR HTTP) transaction dışında ve hata olsa da devam eder —
+    // para çekilmişken kart listesi alınamadı diye abonelik aktifleşmemesin.
+    let utoken: Option<String> = match payload.utoken.as_deref().filter(|u| !u.is_empty()) {
+        Some(ut) => {
+            if let Err(e) = card_repo::upsert_user_token(&state.db, member_id, ut).await {
+                tracing::error!(member_id, error = %e, "utoken kaydedilemedi");
+            }
+            match fetch_paytr_cards(state, ut).await {
+                Ok(cards) => match card_repo::sync_cards(&state.db, ut, &cards).await {
+                    Ok(()) => tracing::info!(member_id, cards = cards.len(), "Kart listesi senkronize edildi"),
+                    Err(e) => tracing::error!(member_id, error = %e, "Kart listesi DB'ye yazılamadı"),
+                },
+                Err(e) => tracing::error!(
+                    member_id, error = ?e,
+                    "PayTR kart listesi alınamadı — abonelik yine de aktifleştiriliyor"
+                ),
+            }
+            Some(ut.to_string())
+        }
+        None => card_repo::get_user_token(&state.db, member_id)
             .await
             .map_err(anyhow::Error::from)?
-            .map(|t| t.utoken)
+            .map(|t| t.utoken),
     };
+    let default_ctoken = match &utoken {
+        Some(ut) => card_repo::get_default_card(&state.db, ut)
+            .await
+            .map_err(anyhow::Error::from)?
+            .map(|c| c.ctoken),
+        None => None,
+    }
+    .or_else(|| payment.ctoken.clone());
 
-    // 5. Abonelik güncelle
+    // Abonelik + müşteri + ödeme durumu tek transaction'da; ödeme satırı kilitli.
+    // Ara adımda hata olursa hiçbiri yazılmaz, PayTR yeniden dener (eskiden abonelik
+    // aktifleşip ödeme pending kalıyor, retry'da "yenileme" sanılıp ek ay veriliyordu).
+    let mut tx = state.db.begin().await.map_err(anyhow::Error::from)?;
+
+    let Some(payment) = payment_repo::find_by_oid_for_update(&mut *tx, &payload.merchant_oid)
+        .await
+        .map_err(anyhow::Error::from)?
+    else {
+        return Ok(());
+    };
+    if payment.status == "success" {
+        // Eşzamanlı çift callback: diğeri bizden önce işledi.
+        tracing::info!(merchant_oid = %payload.merchant_oid, "Eşzamanlı tekrar callback, zaten işlendi");
+        return Ok(());
+    }
+
     let Some(subscription_id) = payment.subscription_id else {
+        payment_repo::set_success(&mut *tx, &payload.merchant_oid)
+            .await
+            .map_err(anyhow::Error::from)?;
+        tx.commit().await.map_err(anyhow::Error::from)?;
         tracing::warn!(merchant_oid = %payload.merchant_oid, "Subscription ID yok, sadece ödeme kaydedildi");
         return Ok(());
     };
 
-    let sub = subscription_repo::find_by_id(&state.db, subscription_id)
+    let sub = subscription_repo::find_by_id_for_update(&mut *tx, subscription_id)
         .await
         .map_err(anyhow::Error::from)?
         .ok_or_else(|| AppError::BadRequest("Abonelik kaydı bulunamadı".to_string()))?;
 
     let now = chrono::Utc::now().naive_utc();
 
-    let is_first_payment = sub.status == "pending";
+    // Hiç aktif olmamış abonelik = ilk ödeme (kullanıcı yeni ödeme başlatınca
+    // `cancel_pending` ile iptal edilmiş eski pending abonelik de dahil).
+    let is_first_payment = sub.started_at.is_none();
 
     // Upgrade: mevcut aboneliğin kalan süresi yeni plana aktarılır.
-    // previous_expires_at metadata'da varsa period_start olarak kullanılır.
     let upgrade_start = if is_first_payment {
         sub.metadata.as_ref()
             .and_then(|m| m.get("previous_expires_at")?.as_str())
@@ -130,58 +179,55 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
         None
     };
 
+    // Yenileme dönemi eski bitişe sabitlenir (grace süresinde geç tahsil edilse de kayma ve
+    // bedava gün olmaz). Abonelik grace sonrası expire olmuşsa yeni dönem şimdiden başlar.
     let period_start = if is_first_payment {
         upgrade_start.unwrap_or(now)
+    } else if sub.status == "expired" {
+        now
     } else {
-        sub.expires_at.unwrap_or(now).max(now)
+        sub.expires_at.unwrap_or(now)
     };
 
     let (expires_at, next_payment_date) = billing_dates(&sub.billing_cycle, period_start);
 
-    if is_first_payment {
-        // İlk ödeme: pending → active
-        let utoken = active_utoken.as_deref().unwrap_or("");
-        let ctoken = if let Some(ref ut) = active_utoken {
-            card_repo::get_default_card(&state.db, ut)
-                .await
-                .map_err(anyhow::Error::from)?
-                .map(|c| c.ctoken)
-                .unwrap_or_default()
-        } else {
-            payment.ctoken.clone().unwrap_or_default()
-        };
-
-        subscription_repo::activate(&state.db, subscription_id, utoken, &ctoken, now, expires_at, next_payment_date)
-            .await
-            .map_err(anyhow::Error::from)?;
-
-        // Upgrade: yeni abonelik aktifleşince önceki aktif aboneliği iptal et.
-        subscription_repo::cancel_active_except(&state.db, member_id, subscription_id)
-            .await
-            .map_err(anyhow::Error::from)?;
-    } else {
-        // Yenileme: scheduled_plan varsa plan değişikliği ile yenile (downgrade).
-        let effective_plan = sub.scheduled_plan.clone().unwrap_or_else(|| sub.plan.clone());
-        if sub.scheduled_plan.is_some() {
-            subscription_repo::renew_with_plan(&state.db, subscription_id, &effective_plan, expires_at, next_payment_date)
-                .await
-                .map_err(anyhow::Error::from)?;
-        } else {
-            subscription_repo::renew(&state.db, subscription_id, expires_at, next_payment_date)
-                .await
-                .map_err(anyhow::Error::from)?;
-        }
-    }
-
-    // 6. customers tablosunu güncelle
-    // Yenilemede effective_plan kullanılır (downgrade yenileme için).
-    let effective_plan_for_customer = if is_first_payment {
+    // Yenilemede planlanmış downgrade uygulanır.
+    let effective_plan = if is_first_payment {
         sub.plan.clone()
     } else {
         sub.scheduled_plan.clone().unwrap_or_else(|| sub.plan.clone())
     };
 
-    let custom_plan = if effective_plan_for_customer == "enterprise" {
+    if is_first_payment {
+        subscription_repo::activate(
+            &mut *tx,
+            subscription_id,
+            utoken.as_deref().unwrap_or(""),
+            default_ctoken.as_deref().unwrap_or(""),
+            now,
+            expires_at,
+            next_payment_date,
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+
+        // Upgrade: önceki aboneliği `replaced` yap, diğer pending'leri iptal et.
+        subscription_repo::replace_others(&mut *tx, member_id, subscription_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+    } else {
+        subscription_repo::renew(
+            &mut *tx,
+            subscription_id,
+            sub.scheduled_plan.as_deref(),
+            expires_at,
+            next_payment_date,
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+    }
+
+    let custom_plan = if effective_plan == "enterprise" {
         sub.metadata.as_ref().and_then(|m| {
             let extra_links = m.get("extra_links")?.as_i64()?;
             let extra_clicks = m.get("extra_clicks")?.as_i64()?;
@@ -194,31 +240,33 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
         None
     };
 
+    // Kullanıcı yenileme tahsil edildikten sonra iptal ettiyse iptal durumu korunur.
+    let customer_status = if !is_first_payment && sub.status == "cancelled" { "cancelled" } else { "active" };
+
     customer_repo::set_subscription_active(
-        &state.db,
+        &mut *tx,
         member_id,
-        &effective_plan_for_customer,
+        &effective_plan,
         subscription_id,
         expires_at,
         next_payment_date,
         custom_plan,
+        customer_status,
     )
     .await
     .map_err(anyhow::Error::from)?;
 
-    // Atomik başarı işareti: eş zamanlı iki callback gelirse yalnızca biri
-    // günceller (TOCTOU koruması). İkincisi false alır ama iş zaten yapıldı.
-    payment_repo::set_success(&state.db, &payload.merchant_oid)
+    payment_repo::set_success(&mut *tx, &payload.merchant_oid)
         .await
         .map_err(anyhow::Error::from)?;
 
-    // Scheduler denemelerini sıfırla
-    let _ = subscription_repo::reset_renewal_attempts(&state.db, subscription_id).await;
+    tx.commit().await.map_err(anyhow::Error::from)?;
 
     tracing::info!(
         member_id,
         merchant_oid = %payload.merchant_oid,
-        plan = %sub.plan,
+        plan = %effective_plan,
+        first = is_first_payment,
         expires_at = %expires_at,
         "Abonelik güncellendi"
     );
@@ -228,11 +276,10 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
         let to = sub.user_email.as_deref().unwrap_or("");
         if !to.is_empty() {
             let expires_str = expires_at.format("%d.%m.%Y").to_string();
-            let is_first = sub.status == "pending";
             let (subject, html) = email::tpl_payment_success(
-                &sub.plan,
+                &effective_plan,
                 &expires_str,
-                is_first,
+                is_first_payment,
                 &email_cfg.site_url,
             );
             email::send(mailer, email_cfg, to, subject, html).await;
@@ -243,24 +290,20 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
 }
 
 async fn handle_failed(state: &crate::AppData, payload: &CallbackPayload) -> Result<(), AppError> {
-    payment_repo::set_failed(
+    // Yalnızca pending ödeme etkilenir: PayTR'ın tekrar bildirimleri ya da scheduler'ın
+    // sync yanıtında zaten işaretlediği ödeme ikinci kez sayılmaz.
+    let Some(p) = payment_repo::set_failed(
         &state.db,
         &payload.merchant_oid,
         payload.failed_reason_code.as_deref(),
         payload.failed_reason_msg.as_deref(),
     )
     .await
-    .map_err(anyhow::Error::from)?;
-
-    let payment = payment_repo::find_by_oid(&state.db, &payload.merchant_oid)
-        .await
-        .map_err(anyhow::Error::from)?;
-
-    if let Some(ref p) = payment {
-        customer_repo::increment_failed_attempts(&state.db, p.member_id)
-            .await
-            .map_err(anyhow::Error::from)?;
-    }
+    .map_err(anyhow::Error::from)?
+    else {
+        tracing::info!(merchant_oid = %payload.merchant_oid, "Başarısız bildirimi: ödeme zaten işlenmiş");
+        return Ok(());
+    };
 
     tracing::warn!(
         merchant_oid = %payload.merchant_oid,
@@ -269,31 +312,34 @@ async fn handle_failed(state: &crate::AppData, payload: &CallbackPayload) -> Res
         "Ödeme başarısız"
     );
 
-    // Başarısız ödeme email bildirimi
-    if let (Some(mailer), Some(email_cfg)) = (&state.mailer, &state.config.email) {
-        if let Some(p) = payment {
-            // Kullanıcı emailini abonelik üzerinden bul
-            if let Some(sub_id) = p.subscription_id {
-                if let Ok(Some(sub)) = subscription_repo::find_by_id(&state.db, sub_id).await {
-                    let to = sub.user_email.as_deref().unwrap_or("");
-                    if !to.is_empty() {
-                        let failed_so_far: i32 = sqlx::query_scalar(
-                            "SELECT COALESCE(failed_payment_attempts,0) FROM customers WHERE member_id=$1",
-                        )
-                        .bind(p.member_id)
-                        .fetch_one(&state.db)
-                        .await
-                        .unwrap_or(0);
-                        let remaining = (state.config.max_failed_attempts - failed_so_far).max(0);
+    // İlk ödeme (3DS) başarısızlıkları yenileme hakkından düşmez; yalnızca yenilemeler.
+    if p.is_3d {
+        return Ok(());
+    }
 
-                        let (subject, html) = email::tpl_payment_failed(
-                            &sub.plan,
-                            payload.failed_reason_msg.as_deref(),
-                            remaining.max(0),
-                            &email_cfg.site_url,
-                        );
-                        email::send(mailer, email_cfg, to, subject, html).await;
-                    }
+    customer_repo::increment_failed_attempts(&state.db, p.member_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    if let Some(sub_id) = p.subscription_id {
+        subscription_repo::increment_renewal_attempts(&state.db, sub_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+    }
+
+    // Başarısız yenileme email bildirimi
+    if let (Some(mailer), Some(email_cfg)) = (&state.mailer, &state.config.email) {
+        if let Some(sub_id) = p.subscription_id {
+            if let Ok(Some(sub)) = subscription_repo::find_by_id(&state.db, sub_id).await {
+                let to = sub.user_email.as_deref().unwrap_or("");
+                if !to.is_empty() {
+                    let remaining = (state.config.max_failed_attempts - sub.renewal_attempts).max(0);
+                    let (subject, html) = email::tpl_payment_failed(
+                        &sub.plan,
+                        payload.failed_reason_msg.as_deref(),
+                        remaining,
+                        &email_cfg.site_url,
+                    );
+                    email::send(mailer, email_cfg, to, subject, html).await;
                 }
             }
         }
@@ -312,7 +358,7 @@ async fn fetch_paytr_cards(state: &crate::AppData, utoken: &str) -> Result<Vec<C
 
     let body: serde_json::Value = state
         .http
-        .post(PAYTR_CARD_LIST_ENDPOINT)
+        .post(paytr_client::card_list_endpoint())
         .form(&[
             ("merchant_id", state.config.merchant_id.as_str()),
             ("utoken",      utoken),
@@ -339,6 +385,8 @@ async fn fetch_paytr_cards(state: &crate::AppData, utoken: &str) -> Result<Vec<C
 }
 
 /// Fatura döngüsüne göre bitiş ve sonraki ödeme tarihlerini hesaplar.
+/// Yalnızca aylık abonelik satılıyor (init'te doğrulanır); "yearly" eski/elle girilmiş
+/// kayıtlar için korunur.
 fn billing_dates(
     billing_cycle: &str,
     from: chrono::NaiveDateTime,
@@ -348,6 +396,29 @@ fn billing_dates(
     } else {
         from + Months::new(1)
     };
-    // Sonraki ödeme = bitiş günü (aynı gün yenilenir)
+    // Sonraki ödeme = bitiş anı; ödeme alınamazsa grace süresince günlük tekrar denenir.
     (expires_at, expires_at)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_amounts_to_kurus() {
+        assert_eq!(amount_to_kurus("149.00"), Some(14_900));
+        assert_eq!(amount_to_kurus("101099.00"), Some(10_109_900));
+        assert_eq!(amount_to_kurus("12.5"), Some(1_250));
+        assert_eq!(amount_to_kurus("99900"), Some(99_900)); // eski kayıt: kuruş
+        assert_eq!(amount_to_kurus("1.234"), None);
+        assert_eq!(amount_to_kurus("abc"), None);
+    }
+
+    #[test]
+    fn monthly_billing_adds_one_month() {
+        let from = chrono::NaiveDate::from_ymd_opt(2026, 1, 31).unwrap().and_hms_opt(10, 0, 0).unwrap();
+        let (exp, next) = billing_dates("monthly", from);
+        assert_eq!(exp.to_string(), "2026-02-28 10:00:00");
+        assert_eq!(exp, next);
+    }
 }

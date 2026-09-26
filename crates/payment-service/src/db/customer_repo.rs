@@ -1,17 +1,6 @@
 use anyhow::Result;
 use chrono::NaiveDateTime;
-use sqlx::PgPool;
-
-/// Email'den member_id'yi çeker (frontend member_id göndermediğinde fallback).
-pub async fn find_member_id_by_email(pool: &PgPool, email: &str) -> Result<Option<i32>> {
-    let id = sqlx::query_scalar::<_, i32>(
-        "SELECT member_id FROM customers WHERE lower(email) = lower($1) LIMIT 1",
-    )
-    .bind(email)
-    .fetch_optional(pool)
-    .await?;
-    Ok(id)
-}
+use sqlx::{PgExecutor, PgPool};
 
 /// plan adını PascalCase'e çevirir ("silver" → "Silver").
 /// qurlbackend Membership enum'ı PascalCase bekler.
@@ -26,20 +15,21 @@ fn plan_to_user_type(plan: &str) -> String {
 /// Ödeme başarılıysa customers tablosunu günceller.
 /// paytr_subscription_id → customers.subscription_id (VARCHAR) olarak saklanır;
 /// qurlbackend bu değeri ProfileDetails.subscription_id'ye parse eder.
-pub async fn set_subscription_active(
-    pool: &PgPool,
+pub async fn set_subscription_active<'e>(
+    ex: impl PgExecutor<'e>,
     member_id: i32,
     plan: &str,
     paytr_subscription_id: i32,
     expires_at: NaiveDateTime,
     next_payment_date: NaiveDateTime,
     custom_plan: Option<String>,
+    subscription_status: &str,
 ) -> Result<()> {
     let user_type = plan_to_user_type(plan);
     sqlx::query(
         r#"
         UPDATE customers
-        SET subscription_status   = 'active',
+        SET subscription_status   = $8,
             subscription_plan     = $1,
             subscription_id       = $2,
             subscription_expires_at = $3,
@@ -61,7 +51,8 @@ pub async fn set_subscription_active(
     .bind(user_type)
     .bind(member_id)
     .bind(custom_plan)
-    .execute(pool)
+    .bind(subscription_status)
+    .execute(ex)
     .await?;
     Ok(())
 }
@@ -90,21 +81,25 @@ pub async fn set_subscription_reactivated(pool: &PgPool, member_id: i32) -> Resu
     Ok(())
 }
 
-/// Abonelik süresi dolduğunda customers'ı Standard'a düşürür.
-pub async fn set_subscription_expired(pool: &PgPool, member_id: i32) -> Result<()> {
-    sqlx::query(
+/// Abonelik süresi dolduğunda customers'ı Standard'a düşürür — yalnızca süresi dolan
+/// abonelik müşterinin güncel aboneliğiyse (upgrade sonrası eski aboneliğin dönemi
+/// bitince yeni planı olan kullanıcı düşürülmesin). Dönüş: düşürüldü mü.
+pub async fn set_subscription_expired(pool: &PgPool, member_id: i32, subscription_id: i32) -> Result<bool> {
+    let r = sqlx::query(
         r#"
         UPDATE customers
         SET subscription_status = 'expired',
             user_type           = 'Standard',
-            subscription_id     = NULL
-        WHERE member_id = $1
+            subscription_id     = NULL,
+            scheduled_plan      = NULL
+        WHERE member_id = $1 AND subscription_id = $2::text
         "#,
     )
     .bind(member_id)
+    .bind(subscription_id)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(r.rows_affected() > 0)
 }
 
 /// Downgrade planlanmış olarak işaretler (dönem sonunda geçiş).

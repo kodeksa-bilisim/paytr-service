@@ -1,4 +1,5 @@
 mod config;
+mod cards;
 mod crypto;
 mod db;
 mod email;
@@ -13,8 +14,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -31,12 +36,28 @@ pub struct AppData {
 
 pub type AppState = Arc<AppData>;
 
+/// Next.js → servis çağrılarını doğrular: `X-Internal-Token` = INTERNAL_API_TOKEN.
+/// Güvenlik yalnızca ağ izolasyonuna (firewall/127.0.0.1) bırakılmaz.
+async fn require_internal_token(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let ok = req
+        .headers()
+        .get("X-Internal-Token")
+        .map(|v| crypto::constant_time_eq(v.as_bytes(), state.config.internal_api_token.as_bytes()))
+        .unwrap_or(false);
+    if !ok {
+        tracing::warn!(path = %req.uri().path(), "Geçersiz/eksik iç API token'ı");
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Yetkisiz" })))
+            .into_response();
+    }
+    next.run(req).await
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "payment_service=debug,tower_http=debug,sqlx=warn".into()),
+                .unwrap_or_else(|_| "payment_service=info,tower_http=info,sqlx=warn".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -79,25 +100,24 @@ async fn main() -> anyhow::Result<()> {
     // Subscription scheduler'ı arka planda başlat
     scheduler::start(Arc::clone(&state));
 
-    let app = Router::new()
-        .route("/health", get(handlers::health))
-        // Ödeme başlatma
+    // Yalnızca Next.js sunucusunun çağırdığı iç API — X-Internal-Token zorunlu.
+    let internal = Router::new()
         .route("/api/v1/payments/init", post(handlers::payment::init_payment))
         .route("/api/v1/payments/init-enterprise", post(handlers::payment::init_enterprise_payment))
-        .route("/api/v1/payments/stored-card", post(handlers::payment::stored_card_payment))
-        // PayTR callback
-        .route("/api/v1/payments/callback", post(handlers::callback::payment_callback))
-        // Redirect placeholder (sync_mode olmayan akış için)
-        .route("/api/v1/payments/ok",   get(handlers::payment_ok))
-        .route("/api/v1/payments/fail", get(handlers::payment_fail))
-        // Abonelik yönetimi
         .route("/api/v1/subscriptions/cancel", post(handlers::subscription::cancel_subscription))
         .route("/api/v1/subscriptions/reactivate", post(handlers::subscription::reactivate_subscription))
         .route("/api/v1/subscriptions/schedule-downgrade", post(handlers::payment::schedule_downgrade))
         .route("/api/v1/subscriptions/cancel-schedule", post(handlers::payment::cancel_scheduled_downgrade))
-        // Kart yönetimi
-        .route("/api/v1/cards/list",   post(handlers::card::list_cards))
-        .route("/api/v1/cards/delete", post(handlers::card::delete_card))
+        .route_layer(middleware::from_fn_with_state(Arc::clone(&state), require_internal_token));
+
+    let app = Router::new()
+        .route("/health", get(handlers::health))
+        // PayTR callback — kimlik doğrulaması hash ile (handler içinde)
+        .route("/api/v1/payments/callback", post(handlers::callback::payment_callback))
+        // Redirect placeholder (sync_mode olmayan akış için)
+        .route("/api/v1/payments/ok",   get(handlers::payment_ok))
+        .route("/api/v1/payments/fail", get(handlers::payment_fail))
+        .merge(internal)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 

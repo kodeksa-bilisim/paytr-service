@@ -1,17 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
-pub struct CardListRequest {
-    pub member_id: i32,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CardDeleteRequest {
-    pub member_id: i32,
-    pub utoken: String,
-    pub ctoken: String,
-}
-
 /// PayTR /capi/list yanıtındaki tek kart.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CardItem {
