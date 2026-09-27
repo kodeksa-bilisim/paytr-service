@@ -56,6 +56,7 @@ pub async fn cancel_subscription(
                 let content = email_templates::subscription_cancelled(
                     name.as_deref(),
                     &sub.plan,
+                    &sub.billing_cycle,
                     sub.expires_at,
                     &email_cfg.site_url,
                 );

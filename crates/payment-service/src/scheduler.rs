@@ -99,6 +99,7 @@ pub async fn process_due(state: &AppState) -> anyhow::Result<()> {
                         let content = email_templates::payment_failed(
                             name.as_deref(),
                             &sub.plan,
+                            &sub.billing_cycle,
                             &sub.amount,
                             None,
                             remaining,
@@ -156,6 +157,7 @@ async fn notify_cvv_required(state: &AppState) {
     struct CvvRow {
         id: i32,
         plan: String,
+        billing_cycle: String,
         email: String,
         name: String,
         expires_at: Option<chrono::NaiveDateTime>,
@@ -163,7 +165,7 @@ async fn notify_cvv_required(state: &AppState) {
 
     let rows = sqlx::query_as::<_, CvvRow>(
         r#"
-        SELECT s.id, s.plan, COALESCE(s.user_email, cu.email, '') AS email, cu.name, s.expires_at
+        SELECT s.id, s.plan, s.billing_cycle, COALESCE(s.user_email, cu.email, '') AS email, cu.name, s.expires_at
         FROM paytr_subscriptions s
         JOIN paytr_cards c ON c.ctoken = s.ctoken AND c.is_active = TRUE
         JOIN customers cu ON cu.member_id = s.member_id
@@ -185,6 +187,7 @@ async fn notify_cvv_required(state: &AppState) {
                 let content = email_templates::cvv_required(
                     Some(&row.name),
                     &row.plan,
+                    &row.billing_cycle,
                     row.expires_at,
                     &email_cfg.site_url,
                 );

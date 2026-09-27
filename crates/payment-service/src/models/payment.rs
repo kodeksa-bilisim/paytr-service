@@ -8,12 +8,12 @@ pub struct InitPaymentRequest {
     /// qurlbackend customers.member_id (zorunlu).
     pub member_id: i32,
     pub plan: String,          // silver, gold
-    pub billing_cycle: String, // yalnızca "monthly"
+    pub billing_cycle: String, // "monthly" | "yearly"
     // --- PayTR alanları ---
     pub user_ip: String,
     pub merchant_oid: String,
     pub email: String,
-    /// TL cinsinden tutar, iki ondalık: "149.00"
+    /// TL cinsinden tutar, iki ondalık: "349.00"
     pub payment_amount: String,
     #[serde(default = "default_payment_type")]
     pub payment_type: String,
@@ -41,6 +41,9 @@ pub struct EnterpriseInitRequest {
     pub users: i32,
     pub extra_links: i32,
     pub extra_clicks: i32,
+    /// "monthly" | "yearly"; göndermeyen eski istemciler için aylık.
+    #[serde(default = "default_billing_cycle")]
+    pub billing_cycle: String,
     pub user_name: String,
     pub user_ip: String,
     pub merchant_oid: String,
@@ -72,6 +75,7 @@ pub struct ScheduleDowngradeResponse {
     pub effective_date: Option<String>, // ISO date string
 }
 
+fn default_billing_cycle() -> String { "monthly".to_string() }
 fn default_payment_type() -> String { "card".to_string() }
 fn default_currency() -> String { "TL".to_string() }
 fn default_lang() -> String { "tr".to_string() }

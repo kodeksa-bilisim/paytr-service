@@ -281,6 +281,7 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
                     name: name.as_deref(),
                     plan: &effective_plan,
                     amount: &payment.amount,
+                    billing_cycle: &sub.billing_cycle,
                     expires_at,
                     order_no: &payload.merchant_oid,
                     site_url: &email_cfg.site_url,
@@ -343,6 +344,7 @@ async fn handle_failed(state: &crate::AppData, payload: &CallbackPayload) -> Res
                     let content = email_templates::payment_failed(
                         name.as_deref(),
                         &sub.plan,
+                        &sub.billing_cycle,
                         &p.amount,
                         payload.failed_reason_msg.as_deref(),
                         remaining,
@@ -394,8 +396,7 @@ async fn fetch_paytr_cards(state: &crate::AppData, utoken: &str) -> Result<Vec<C
 }
 
 /// Fatura döngüsüne göre bitiş ve sonraki ödeme tarihlerini hesaplar.
-/// Yalnızca aylık abonelik satılıyor (init'te doğrulanır); "yearly" eski/elle girilmiş
-/// kayıtlar için korunur.
+/// Yıllık abonelik 12 ay, aylık 1 ay sürer (tutar init'te döneme göre doğrulanır).
 fn billing_dates(
     billing_cycle: &str,
     from: chrono::NaiveDateTime,
@@ -429,5 +430,12 @@ mod tests {
         let (exp, next) = billing_dates("monthly", from);
         assert_eq!(exp.to_string(), "2026-02-28 10:00:00");
         assert_eq!(exp, next);
+    }
+
+    #[test]
+    fn yearly_billing_adds_twelve_months() {
+        let from = chrono::NaiveDate::from_ymd_opt(2028, 2, 29).unwrap().and_hms_opt(10, 0, 0).unwrap();
+        let (exp, _) = billing_dates("yearly", from);
+        assert_eq!(exp.to_string(), "2029-02-28 10:00:00");
     }
 }
