@@ -83,7 +83,7 @@ impl Config {
             merchant_id: std::env::var("MERCHANT_ID").context("MERCHANT_ID eksik")?,
             merchant_key: std::env::var("MERCHANT_KEY").context("MERCHANT_KEY eksik")?,
             merchant_salt: std::env::var("MERCHANT_SALT").context("MERCHANT_SALT eksik")?,
-            host: std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
+            host: std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
             port: std::env::var("PORT")
                 .unwrap_or_else(|_| "3001".to_string())
                 .parse()

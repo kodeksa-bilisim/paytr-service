@@ -10,7 +10,7 @@ use crate::{
         card::CardItem,
     },
     paytr_client,
-    pricing::{amount_to_kurus, billing_dates},
+    pricing::{amount_to_kurus, billing_dates, renewal_dates},
     AppState,
 };
 
@@ -63,7 +63,7 @@ fn first_payment_conflicts(sub: &PaytrSubscription, others: &[PaytrSubscription]
 }
 
 /// Yöneticiye inceleme uyarısı (e-posta yapılandırılmamışsa yalnızca log).
-async fn alert_review(state: &crate::AppData, reason: &str, payload: &CallbackPayload, member_id: i32, subscription_id: Option<i32>) {
+pub(crate) async fn alert_review(state: &crate::AppData, reason: &str, payload: &CallbackPayload, member_id: i32, subscription_id: Option<i32>) {
     tracing::error!(
         merchant_oid = %payload.merchant_oid, member_id, subscription_id, reason,
         "Ödeme incelemeye alındı — abonelik değiştirilmedi, iade gerekebilir"
@@ -84,7 +84,7 @@ async fn alert_review(state: &crate::AppData, reason: &str, payload: &CallbackPa
     email::send(mailer, email_cfg, to, content).await;
 }
 
-async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Result<(), AppError> {
+pub(crate) async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Result<(), AppError> {
     // "Bulunamadı" durumunda OK döndür — PayTR'nin yeniden denemesi bu durumu düzeltemez.
     // Gerçek DB hatalarında Err döner, PayTR yeniden dener (geçici hata kurtarma).
     let Some(payment) = payment_repo::find_by_oid(&state.db, &payload.merchant_oid)
@@ -243,7 +243,13 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
         sub.expires_at.unwrap_or(now)
     };
 
-    let (expires_at, next_payment_date) = billing_dates(&sub.billing_cycle, period_start);
+    // Yenilemede fatura günü abonelik başlangıcına sabitlenir (31 Oca → 28 Şub → 31 Mar).
+    let (expires_at, next_payment_date) = match sub.started_at {
+        Some(start) if !is_first_payment && sub.status != "expired" => {
+            renewal_dates(&sub.billing_cycle, period_start, chrono::Datelike::day(&start))
+        }
+        _ => billing_dates(&sub.billing_cycle, period_start),
+    };
 
     // Yenilemede planlanmış downgrade uygulanır.
     let effective_plan = if is_first_payment {
@@ -424,6 +430,8 @@ async fn fetch_paytr_cards(state: &crate::AppData, utoken: &str) -> Result<Vec<C
     let body: serde_json::Value = state
         .http
         .post(paytr_client::card_list_endpoint())
+        // Callback yanıtı bunu bekler; PayTR bildirimi zaman aşımına uğramasın.
+        .timeout(std::time::Duration::from_secs(10))
         .form(&[
             ("merchant_id", state.config.merchant_id.as_str()),
             ("utoken",      utoken),

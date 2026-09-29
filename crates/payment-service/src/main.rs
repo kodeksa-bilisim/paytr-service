@@ -34,6 +34,8 @@ pub struct AppData {
     pub http: reqwest::Client,
     pub db: Db,
     pub mailer: Option<email::Mailer>,
+    /// Scheduler'ın son başarılı çalışması (unix saniye; 0 = henüz yok).
+    pub scheduler_last_ok: std::sync::atomic::AtomicI64,
 }
 
 pub type AppState = Arc<AppData>;
@@ -98,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
         http,
         db,
         mailer,
+        scheduler_last_ok: std::sync::atomic::AtomicI64::new(0),
     });
 
     // Subscription scheduler'ı arka planda başlat

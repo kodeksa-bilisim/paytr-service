@@ -92,9 +92,18 @@ seed_sub 601 6 gold 299.00 ut6 "$UTC + interval '2 hours'"
 seed_sub 801 8 gold 899.00 ut8 "$UTC + interval '10 days'"
 seed_sub 901 9 silver 3350.40 ut9 "$UTC + interval '360 days'" yearly
 sql "SELECT setval('paytr_subscriptions_id_seq', 1000);" >/dev/null
-# 3 gün önce kalmış, callback'i gelmemiş pending ödeme
-sql "INSERT INTO paytr_payments(member_id,subscription_id,merchant_oid,amount,status,created_at)
-     VALUES (6,601,'old6',  '299.00','pending', now() - interval '3 days');"
+# Callback'i gelmemiş eski pending ödemeler (PayTR durum sorgusu: old6 → 004, paid4x → başarılı,
+# unk5 → geçici hata, unk9 → 8 gündür bilinmiyor)
+sql "INSERT INTO paytr_payments(member_id,subscription_id,merchant_oid,amount,status,is_3d,created_at) VALUES
+     (6,601,'old6',  '299.00','pending',true,  now() - interval '3 days'),
+     (4,401,'paid4x','299.00','pending',false, now() - interval '3 days'),
+     (5,501,'unk5',  '299.00','pending',false, now() - interval '3 days'),
+     (9,901,'unk9',  '3350.40','pending',false, now() - interval '8 days');"
+OLD401=$(sql "SELECT expires_at FROM paytr_subscriptions WHERE id=401")
+# Üye 2'nin ikinci utoken'ı ve PayTR'ın silemediği bir kartı
+sql "INSERT INTO paytr_user_tokens(member_id,utoken) VALUES (2,'ut2b'),(2,'ut2bad');
+     INSERT INTO paytr_cards(utoken,ctoken,last_4,expiry_month,expiry_year) VALUES
+       ('ut2b','ctut2b','2222','12','30'), ('ut2bad','ctut2bad','3333','12','30');"
 
 echo "== Güvenlik / doğrulama"
 eq "health" "$(curl -s -o /dev/null -w '%{http_code}' $BASE/health)" 200
@@ -120,7 +129,11 @@ eq "reddedilen yenileme: ödeme failed" "$(sql "SELECT status FROM paytr_payment
 eq "reddedilen yenileme: 1 deneme sayıldı" "$(sql "SELECT renewal_attempts FROM paytr_subscriptions WHERE id=201")" 1
 eq "reddedilen yenileme: grace içinde hâlâ aktif" "$(sql "SELECT status FROM paytr_subscriptions WHERE id=201")" active
 eq "saat dilimi: 2 saat sonra biten abonelik dokunulmadı" "$(sql "SELECT status||'/'||(SELECT count(*) FROM paytr_payments WHERE subscription_id=601 AND merchant_oid<>'old6') FROM paytr_subscriptions WHERE id=601")" "active/0"
-eq "callback'i gelmeyen eski pending → failed" "$(sql "SELECT status||':'||failed_reason_msg FROM paytr_payments WHERE merchant_oid='old6'")" "failed:no_callback"
+eq "callback'i gelmeyen, PayTR'da başarısız (004) → failed" "$(sql "SELECT status||':'||failed_reason_msg FROM paytr_payments WHERE merchant_oid='old6'")" "failed:no_callback"
+eq "callback'i gelmeyen ama PayTR'da başarılı → işlendi, 1 ay uzadı" "$(sql "SELECT p.status||'/'||(s.expires_at = timestamp '$OLD401' + interval '1 month') FROM paytr_payments p JOIN paytr_subscriptions s ON s.id=p.subscription_id WHERE p.merchant_oid='paid4x'")" "success/true"
+eq "durum öğrenilemeyen ödeme pending kaldı" "$(sql "SELECT status FROM paytr_payments WHERE merchant_oid='unk5'")" pending
+eq "7 günü aşan bilinmeyen durum → review" "$(sql "SELECT status||':'||failed_reason_msg FROM paytr_payments WHERE merchant_oid='unk9'")" "review:status_unknown"
+eq "health: scheduler son çalışması görünüyor" "$(curl -s $BASE/health | python3 -c "import json,sys;print(json.load(sys.stdin)['scheduler_last_ok_age_secs'] is not None)")" True
 tick
 eq "reddedilen yenileme aynı gün tekrar denenmedi" "$(sql "SELECT count(*) FROM paytr_payments WHERE subscription_id=201")" 1
 
@@ -149,6 +162,9 @@ eq "grace sonrası abonelik expired" "$(sql "SELECT status FROM paytr_subscripti
 eq "müşteri Standard'a düştü" "$(sql "SELECT user_type||'/'||coalesce(subscription_id,'null') FROM customers WHERE member_id=2")" "Standard/null"
 eq "kartlar silindi (DB)" "$(sql "SELECT count(*) FROM paytr_cards WHERE utoken='ut2' AND is_active")" 0
 eq "kartlar silindi (PayTR)" "$(grep -c '"path": "/odeme/capi/delete".*"utoken": "ut2"' "$MOCK_LOG")" 1
+eq "ikinci utoken'daki kart kendi utoken'ıyla silindi" "$(grep -c '"path": "/odeme/capi/delete".*"utoken": "ut2b",.*"ctoken": "ctut2b"' "$MOCK_LOG")" 1
+eq "PayTR'ın silemediği kart DB'de aktif kaldı (yeniden denenecek)" "$(sql "SELECT count(*) FROM paytr_cards WHERE utoken='ut2bad' AND is_active")" 1
+eq "boşalan utoken pasif, dolu olan aktif" "$(sql "SELECT string_agg(utoken||':'||is_active, ',' ORDER BY utoken) FROM paytr_user_tokens WHERE member_id=2")" "ut2:false,ut2b:false,ut2bad:true"
 
 echo "== Upgrade (Silver → Gold, fark ücreti)"
 eq "upgrade quote → 200" "$(post /api/v1/subscriptions/upgrade-quote '{"member_id":3,"plan":"gold","billing_cycle":"monthly"}' $TOKEN)" 200

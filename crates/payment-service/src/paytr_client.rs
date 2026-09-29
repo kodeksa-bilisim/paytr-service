@@ -17,6 +17,10 @@ pub fn card_list_endpoint() -> String {
     format!("{}/odeme/capi/list", base())
 }
 
+pub fn status_query_endpoint() -> String {
+    format!("{}/odeme/durum-sorgu", base())
+}
+
 pub fn card_delete_endpoint() -> String {
     format!("{}/odeme/capi/delete", base())
 }

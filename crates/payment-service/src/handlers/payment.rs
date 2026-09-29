@@ -204,13 +204,18 @@ pub async fn init_payment(
         .map_err(|e| AppError::BadRequest(format!("Sepet hatası: {}", e)))?;
 
     // Mevcut pending aboneliği temizle (tekrar tıklama / modal yeniden açma)
-    subscription_repo::cancel_pending(&state.db, member_id)
+    // Eski pending'in iptali ve yeni kayıtlar tek transaction'da, üye kilidi altında.
+    let mut tx = state.db.begin().await.map_err(anyhow::Error::from)?;
+    subscription_repo::lock_member(&mut *tx, member_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    subscription_repo::cancel_pending(&mut *tx, member_id)
         .await
         .map_err(anyhow::Error::from)?;
 
     // Pending abonelik: tutarı liste fiyatı (yenilemelerde çekilen).
     let subscription = subscription_repo::create(
-        &state.db,
+        &mut *tx,
         member_id,
         &req.plan,
         &req.billing_cycle,
@@ -243,7 +248,7 @@ pub async fn init_payment(
 
     // Pending ödeme kaydı: tahsil edilen tutar (callback'teki tutar kontrolü buna göre).
     let payment = payment_repo::create(
-        &state.db,
+        &mut *tx,
         payment_repo::NewPayment {
             member_id,
             subscription_id: Some(subscription.id),
@@ -260,6 +265,7 @@ pub async fn init_payment(
     )
     .await
     .map_err(anyhow::Error::from)?;
+    tx.commit().await.map_err(anyhow::Error::from)?;
 
     tracing::info!(
         member_id,
@@ -350,12 +356,17 @@ pub async fn init_enterprise_payment(
         m.extend(up);
     }
 
-    subscription_repo::cancel_pending(&state.db, member_id)
+    // Eski pending'in iptali ve yeni kayıtlar tek transaction'da, üye kilidi altında.
+    let mut tx = state.db.begin().await.map_err(anyhow::Error::from)?;
+    subscription_repo::lock_member(&mut *tx, member_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    subscription_repo::cancel_pending(&mut *tx, member_id)
         .await
         .map_err(anyhow::Error::from)?;
 
     let subscription = subscription_repo::create(
-        &state.db,
+        &mut *tx,
         member_id,
         "enterprise",
         &req.billing_cycle,
@@ -387,7 +398,7 @@ pub async fn init_enterprise_payment(
     );
 
     let payment = payment_repo::create(
-        &state.db,
+        &mut *tx,
         payment_repo::NewPayment {
             member_id,
             subscription_id: Some(subscription.id),
@@ -404,6 +415,7 @@ pub async fn init_enterprise_payment(
     )
     .await
     .map_err(anyhow::Error::from)?;
+    tx.commit().await.map_err(anyhow::Error::from)?;
 
     tracing::info!(
         member_id,

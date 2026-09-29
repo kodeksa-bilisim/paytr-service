@@ -50,20 +50,30 @@ pub async fn reactivate_by_member(pool: &PgPool, member_id: i32) -> Result<bool>
     Ok(result.rows_affected() > 0)
 }
 
+/// Üye bazında transaction kilidi: aynı üyenin eşzamanlı ödeme başlatmaları sıraya girer
+/// (eski pending iptali + yeni kayıtlar birbirine karışmasın).
+pub async fn lock_member<'e>(ex: impl PgExecutor<'e>, member_id: i32) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(7461, $1)")
+        .bind(member_id)
+        .execute(ex)
+        .await?;
+    Ok(())
+}
+
 /// Yeni ödeme başlamadan önce aynı kullanıcının eski pending aboneliklerini temizler.
-pub async fn cancel_pending(pool: &PgPool, member_id: i32) -> Result<()> {
+pub async fn cancel_pending<'e>(ex: impl PgExecutor<'e>, member_id: i32) -> Result<()> {
     sqlx::query(
         "UPDATE paytr_subscriptions SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()
          WHERE member_id = $1 AND status = 'pending'",
     )
     .bind(member_id)
-    .execute(pool)
+    .execute(ex)
     .await?;
     Ok(())
 }
 
-pub async fn create(
-    pool: &PgPool,
+pub async fn create<'e>(
+    ex: impl PgExecutor<'e>,
     member_id: i32,
     plan: &str,
     billing_cycle: &str,
@@ -89,7 +99,7 @@ pub async fn create(
     .bind(user_phone)
     .bind(user_email)
     .bind(metadata)
-    .fetch_one(pool)
+    .fetch_one(ex)
     .await?;
     Ok(sub)
 }

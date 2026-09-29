@@ -1,7 +1,7 @@
 //! Fiyat tablosu, tutar biçimleri ve yükseltme (upgrade) fark ücreti hesabı.
 //! Tutarlar kuruş (i64) olarak hesaplanır; PayTR'a ve DB'ye TL biçiminde ("349.00") yazılır.
 
-use chrono::{Months, NaiveDateTime};
+use chrono::{Datelike, Months, NaiveDateTime};
 
 /// Planın sıralaması: düşük = düşük plan. Upgrade/downgrade tespiti için.
 pub fn plan_rank(plan: &str) -> u8 {
@@ -75,6 +75,16 @@ pub fn amount_to_kurus(amount: &str) -> Option<i64> {
     }
 }
 
+/// PayTR yanıtlarındaki TL tutarını kuruşa çevirir ("10.8" → 1080, "299" → 29900).
+/// `amount_to_kurus`'tan farkı: noktasız değer TL'dir (eski DB kaydı değil).
+pub fn tl_to_kurus(amount: &str) -> Option<i64> {
+    let a = amount.trim();
+    match a.split_once('.') {
+        None => a.parse::<i64>().ok().map(|tl| tl * 100),
+        Some(_) => amount_to_kurus(a),
+    }
+}
+
 pub fn cycle_months(billing_cycle: &str) -> u32 {
     if billing_cycle == "yearly" { 12 } else { 1 }
 }
@@ -84,6 +94,24 @@ pub fn cycle_months(billing_cycle: &str) -> u32 {
 pub fn billing_dates(billing_cycle: &str, from: NaiveDateTime) -> (NaiveDateTime, NaiveDateTime) {
     let expires_at = from + Months::new(cycle_months(billing_cycle));
     (expires_at, expires_at)
+}
+
+fn days_in_month(d: NaiveDateTime) -> u32 {
+    let first = d.date().with_day(1).expect("1. gün her ayda var");
+    let next = first + Months::new(1);
+    (next - first).num_days() as u32
+}
+
+/// Yenileme dönemi: `billing_dates` gibi, ancak önceki bitiş ay sonuna kırpılmışsa
+/// (31 Oca → 28 Şub) abonelik başladığı güne geri döner (28 Şub → 31 Mar, 28 Mar değil).
+pub fn renewal_dates(billing_cycle: &str, from: NaiveDateTime, anchor_day: u32) -> (NaiveDateTime, NaiveDateTime) {
+    let (mut exp, _) = billing_dates(billing_cycle, from);
+    let from_was_clamped = from.day() == days_in_month(from) && anchor_day > from.day();
+    if from_was_clamped {
+        let day = anchor_day.min(days_in_month(exp));
+        exp = exp.with_day(day).unwrap_or(exp);
+    }
+    (exp, exp)
 }
 
 /// Yükseltmede alınacak en düşük tutar (kuruş). Kalan değer yeni planı karşılıyorsa
@@ -121,6 +149,10 @@ mod tests {
         assert_eq!(amount_to_kurus("99900"), Some(99_900)); // eski kayıt: kuruş
         assert_eq!(amount_to_kurus("1.234"), None);
         assert_eq!(amount_to_kurus("abc"), None);
+        assert_eq!(tl_to_kurus("10.8"), Some(1_080));
+        assert_eq!(tl_to_kurus("299"), Some(29_900));
+        assert_eq!(tl_to_kurus("849.34"), Some(84_934));
+        assert_eq!(tl_to_kurus("x"), None);
     }
 
     #[test]
@@ -136,6 +168,19 @@ mod tests {
         let from = chrono::NaiveDate::from_ymd_opt(2028, 2, 29).unwrap().and_hms_opt(10, 0, 0).unwrap();
         let (exp, _) = billing_dates("yearly", from);
         assert_eq!(exp.to_string(), "2029-02-28 10:00:00");
+    }
+
+    #[test]
+    fn renewal_returns_to_anchor_day_after_short_month() {
+        let t = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(10, 0, 0).unwrap();
+        // 31 Oca'da başladı: 28 Şub → 31 Mar → 30 Nis (ay sonu)
+        assert_eq!(renewal_dates("monthly", t(2026, 2, 28), 31).0, t(2026, 3, 31));
+        assert_eq!(renewal_dates("monthly", t(2026, 3, 31), 31).0, t(2026, 4, 30));
+        // Kırpılmamış tarihte değişmez; ayın 15'i başlangıcı etkilenmez
+        assert_eq!(renewal_dates("monthly", t(2026, 3, 5), 31).0, t(2026, 4, 5));
+        assert_eq!(renewal_dates("monthly", t(2026, 2, 15), 15).0, t(2026, 3, 15));
+        // Artık yılda yıllık: 29 Şub 2028 → 28 Şub 2029 → 29 Şub 2032'ye kadar ay sonu
+        assert_eq!(renewal_dates("yearly", t(2029, 2, 28), 29).0, t(2030, 2, 28));
     }
 
     #[test]
