@@ -265,6 +265,10 @@ pub fn plan_label(plan: &str) -> String {
     }
 }
 
+pub fn cycle_label(billing_cycle: &str) -> &'static str {
+    if billing_cycle == "yearly" { "yıllık" } else { "aylık" }
+}
+
 fn plans_url(site_url: &str) -> String {
     format!("{}/tr/app/plans", site_url.trim_end_matches('/'))
 }
@@ -275,6 +279,8 @@ pub struct PaymentInfo<'a> {
     pub name: Option<&'a str>,
     pub plan: &'a str,
     pub amount: &'a str,
+    /// "monthly" | "yearly"
+    pub billing_cycle: &'a str,
     pub expires_at: chrono::NaiveDateTime,
     pub order_no: &'a str,
     pub site_url: &'a str,
@@ -307,17 +313,20 @@ pub fn payment_success(p: &PaymentInfo, is_first: bool, renews: bool) -> EmailCo
     };
     let date = format_date_tr(p.expires_at);
     let mut details = vec![
-        ("Plan", format!("{plan} (aylık)")),
+        ("Plan", format!("{plan} ({})", cycle_label(p.billing_cycle))),
         ("Tutar", format_tl(p.amount)),
         ("Dönem bitişi", date.clone()),
     ];
     let note = if renews {
         details.push(("Sonraki ödeme", date.clone()));
-        "Aboneliğiniz her ay kayıtlı kartınızdan otomatik olarak yenilenir. Dilediğiniz zaman Planlar sayfasından \
-         iptal edebilirsiniz; iptal durumunda mevcut dönemin sonuna kadar planınızı kullanmaya devam edersiniz."
+        format!(
+            "Aboneliğiniz her {} kayıtlı kartınızdan otomatik olarak yenilenir. Dilediğiniz zaman Planlar sayfasından \
+             iptal edebilirsiniz; iptal durumunda mevcut dönemin sonuna kadar planınızı kullanmaya devam edersiniz.",
+            if p.billing_cycle == "yearly" { "yıl" } else { "ay" }
+        )
     } else {
         details.push(("Otomatik yenileme", "Kapalı".to_string()));
-        "Aboneliğiniz iptal edilmiş olduğundan bu dönemin sonunda yenilenmeyecektir."
+        "Aboneliğiniz iptal edilmiş olduğundan bu dönemin sonunda yenilenmeyecektir.".to_string()
     };
     details.push(("Sipariş no", p.order_no.to_string()));
     let preheader = format!("{plan} plan aboneliğiniz {date} tarihine kadar geçerlidir.");
@@ -341,6 +350,7 @@ pub fn payment_success(p: &PaymentInfo, is_first: bool, renews: bool) -> EmailCo
 pub fn payment_failed(
     name: Option<&str>,
     plan: &str,
+    billing_cycle: &str,
     amount: &str,
     reason: Option<&str>,
     attempts_left: i32,
@@ -373,7 +383,7 @@ pub fn payment_failed(
         ],
         features: vec![],
         details: vec![
-            ("Plan", format!("{plan_l} (aylık)")),
+            ("Plan", format!("{plan_l} ({})", cycle_label(billing_cycle))),
             ("Tutar", format_tl(amount)),
             (
                 "Sebep",
@@ -397,11 +407,12 @@ pub fn payment_failed(
 pub fn cvv_required(
     name: Option<&str>,
     plan: &str,
+    billing_cycle: &str,
     expires_at: Option<chrono::NaiveDateTime>,
     site_url: &str,
 ) -> EmailContent {
     let plan_l = plan_label(plan);
-    let mut details = vec![("Plan", format!("{plan_l} (aylık)"))];
+    let mut details = vec![("Plan", format!("{plan_l} ({})", cycle_label(billing_cycle)))];
     if let Some(e) = expires_at {
         details.push(("Dönem bitişi", format_date_tr(e)));
     }
@@ -433,6 +444,7 @@ pub fn cvv_required(
 pub fn subscription_cancelled(
     name: Option<&str>,
     plan: &str,
+    billing_cycle: &str,
     expires_at: Option<chrono::NaiveDateTime>,
     site_url: &str,
 ) -> EmailContent {
@@ -458,7 +470,7 @@ pub fn subscription_cancelled(
         ],
         features: vec![],
         details: vec![
-            ("Plan", format!("{plan_l} (aylık)")),
+            ("Plan", format!("{plan_l} ({})", cycle_label(billing_cycle))),
             ("Erişim bitişi", date.clone()),
             ("Otomatik yenileme", "Kapalı".to_string()),
         ],
@@ -495,7 +507,7 @@ mod tests {
 
     #[test]
     fn reason_is_escaped() {
-        let m = payment_failed(None, "gold", "299.00", Some("<b>x</b>"), 2, "https://nlink.tr");
+        let m = payment_failed(None, "gold", "monthly", "899.00", Some("<b>x</b>"), 2, "https://nlink.tr");
         assert!(m.html.contains("&lt;b&gt;x&lt;/b&gt;"));
         assert!(!m.html.contains("<b>x"));
         // Düz metin HTML olarak yorumlanmaz; değer olduğu gibi kalır.
@@ -512,7 +524,8 @@ mod tests {
         let info = PaymentInfo {
             name: Some("Ayşe Yılmaz"),
             plan: "gold",
-            amount: "299.00",
+            amount: "899.00",
+            billing_cycle: "monthly",
             expires_at: dt("2026-11-01 01:13:12"),
             order_no: "u41t1790000000000",
             site_url: site,
@@ -522,9 +535,9 @@ mod tests {
         for (file, m) in [
             ("odeme-onayi", payment_success(&info, true, true)),
             ("yenileme-onayi", payment_success(&renewal, false, true)),
-            ("odeme-alinamadi", payment_failed(Some("Ayşe Yılmaz"), "gold", "299.00", Some("Yetersiz bakiye"), 2, site)),
-            ("cvv-gerekli", cvv_required(Some("Ayşe Yılmaz"), "gold", Some(dt("2026-11-01 01:13:12")), site)),
-            ("iptal", subscription_cancelled(Some("Ayşe Yılmaz"), "gold", Some(dt("2026-11-01 01:13:12")), site)),
+            ("odeme-alinamadi", payment_failed(Some("Ayşe Yılmaz"), "gold", "yearly", "8630.40", Some("Yetersiz bakiye"), 2, site)),
+            ("cvv-gerekli", cvv_required(Some("Ayşe Yılmaz"), "gold", "monthly", Some(dt("2026-11-01 01:13:12")), site)),
+            ("iptal", subscription_cancelled(Some("Ayşe Yılmaz"), "gold", "monthly", Some(dt("2026-11-01 01:13:12")), site)),
         ] {
             std::fs::write(dir.join(format!("{file}.html")), &m.html).unwrap();
             std::fs::write(dir.join(format!("{file}.txt")), format!("Konu: {}\n\n{}", m.subject, m.text)).unwrap();

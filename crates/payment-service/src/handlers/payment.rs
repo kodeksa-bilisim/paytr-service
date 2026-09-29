@@ -22,13 +22,32 @@ fn plan_rank(plan: &str) -> u8 {
     }
 }
 
-/// Plan adına karşılık gelen aylık TL tutarı.
-fn plan_amount_tl(plan: &str) -> Option<&'static str> {
-    match plan.to_lowercase().as_str() {
-        "silver" => Some("149.00"),
-        "gold"   => Some("299.00"),
-        _        => None,
+/// Yıllık faturalandırmada uygulanan indirim (%).
+const YEARLY_DISCOUNT_PCT: i64 = 20;
+
+/// Aylık tutarı faturalandırma dönemine çevirir: yıllık = 12 ay − %20.
+fn cycle_amount_kurus(monthly_kurus: i64, billing_cycle: &str) -> Option<i64> {
+    match billing_cycle {
+        "monthly" => Some(monthly_kurus),
+        "yearly" => Some(monthly_kurus * 12 * (100 - YEARLY_DISCOUNT_PCT) / 100),
+        _ => None,
     }
+}
+
+/// Plan ve döneme karşılık gelen tutar (kuruş). Fiyat tablosu yalnızca burada tanımlı;
+/// mevcut abonelikler yenilemede kayıtlı tutarlarıyla devam eder.
+fn plan_amount_kurus(plan: &str, billing_cycle: &str) -> Option<i64> {
+    let monthly = match plan {
+        "silver" => 34_900,
+        "gold" => 89_900,
+        _ => return None,
+    };
+    cycle_amount_kurus(monthly, billing_cycle)
+}
+
+/// Kuruşu PayTR'ın beklediği TL biçimine çevirir: 34900 → "349.00".
+fn format_tl(kurus: i64) -> String {
+    format!("{}.{:02}", kurus / 100, kurus % 100)
 }
 
 /// Redirect URL'nin güvenli olduğunu doğrular: yalnızca https:// kabul edilir.
@@ -42,12 +61,10 @@ fn validate_redirect_url(url: &str, field: &str) -> Result<(), AppError> {
 }
 
 /// Plan ile tutar uyumunu doğrular — frontend manipülasyonunu önler.
-fn validate_plan_amount(plan: &str, amount: &str) -> Result<(), AppError> {
-    let expected = match plan {
-        "silver" => "149.00",
-        "gold"   => "299.00",
-        _ => return Err(AppError::BadRequest(format!("Geçersiz plan: {}", plan))),
-    };
+fn validate_plan_amount(plan: &str, billing_cycle: &str, amount: &str) -> Result<(), AppError> {
+    let expected = plan_amount_kurus(plan, billing_cycle)
+        .map(format_tl)
+        .ok_or_else(|| AppError::BadRequest(format!("Geçersiz plan: {}", plan)))?;
     if amount != expected {
         return Err(AppError::BadRequest(format!(
             "Tutar plan ile uyuşmuyor (beklenen: {} TL)",
@@ -57,16 +74,16 @@ fn validate_plan_amount(plan: &str, amount: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Ödeme koşulları: fiyat tablosu yalnızca aylık/TL/tek çekim için tanımlı. Aksi halde
-/// ör. "yearly" ile aylık fiyata 12 ay alınabiliyordu.
+/// Ödeme koşulları: aylık/yıllık, TL, tek çekim. Tutar `validate_plan_amount` ile döneme
+/// göre ayrıca doğrulanır (yıllık abonelik aylık fiyata alınamaz).
 fn validate_payment_terms(
     billing_cycle: &str,
     currency: &str,
     payment_type: &str,
     installment_count: u8,
 ) -> Result<(), AppError> {
-    if billing_cycle != "monthly" {
-        return Err(AppError::BadRequest("Yalnızca aylık abonelik destekleniyor".to_string()));
+    if billing_cycle != "monthly" && billing_cycle != "yearly" {
+        return Err(AppError::BadRequest("Geçersiz faturalandırma dönemi".to_string()));
     }
     if currency != "TL" {
         return Err(AppError::BadRequest("Yalnızca TL destekleniyor".to_string()));
@@ -85,7 +102,7 @@ const ENTERPRISE_MAX_EXTRA: i32 = 10_000;
 
 /// Enterprise aylık fiyatı (kuruş). Negatif/aşırı değerler reddedilir — aksi halde
 /// `extra_links=-9` gibi değerlerle fiyat düşürülebiliyordu.
-fn enterprise_price_kurus(users: i32, extra_links: i32, extra_clicks: i32) -> Result<i64, AppError> {
+fn enterprise_price_kurus(users: i32, extra_links: i32, extra_clicks: i32, billing_cycle: &str) -> Result<i64, AppError> {
     if !(1..=ENTERPRISE_MAX_USERS).contains(&users) {
         return Err(AppError::BadRequest(format!(
             "Kullanıcı sayısı 1–{} arasında olmalı",
@@ -98,17 +115,19 @@ fn enterprise_price_kurus(users: i32, extra_links: i32, extra_clicks: i32) -> Re
             ENTERPRISE_MAX_EXTRA
         )));
     }
-    Ok(99_900
+    let monthly = 199_900
         + (users as i64 - 1) * 15_000
         + extra_links as i64 * 10_000
-        + extra_clicks as i64 * 5_000)
+        + extra_clicks as i64 * 5_000;
+    cycle_amount_kurus(monthly, billing_cycle)
+        .ok_or_else(|| AppError::BadRequest("Geçersiz faturalandırma dönemi".to_string()))
 }
 
 pub async fn init_payment(
     State(state): State<AppState>,
     Json(req): Json<InitPaymentRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    validate_plan_amount(&req.plan, &req.payment_amount)?;
+    validate_plan_amount(&req.plan, &req.billing_cycle, &req.payment_amount)?;
     validate_payment_terms(&req.billing_cycle, &req.currency, &req.payment_type, req.installment_count)?;
     validate_redirect_url(&req.merchant_ok_url, "merchant_ok_url")?;
     validate_redirect_url(&req.merchant_fail_url, "merchant_fail_url")?;
@@ -250,8 +269,8 @@ pub async fn init_enterprise_payment(
     }
     let member_id = req.member_id;
 
-    let total_kurus = enterprise_price_kurus(req.users, req.extra_links, req.extra_clicks)?;
-    let payment_amount = format!("{}.{:02}", total_kurus / 100, total_kurus % 100); // TL cinsinden
+    let total_kurus = enterprise_price_kurus(req.users, req.extra_links, req.extra_clicks, &req.billing_cycle)?;
+    let payment_amount = format_tl(total_kurus);
 
     // Enterprise zaten aktifse yeni ödeme alınmaz (kalan süre yanardı).
     if let Some(sub) = subscription_repo::find_active(&state.db, member_id)
@@ -264,7 +283,8 @@ pub async fn init_enterprise_payment(
     }
 
     let basket_label = format!(
-        "Enterprise Plan ({} kullanıcı, {}k link/ay, {}k tıklama/ay)",
+        "Enterprise Plan{} ({} kullanıcı, {}k link/ay, {}k tıklama/ay)",
+        if req.billing_cycle == "yearly" { " - Yıllık" } else { "" },
         req.users,
         10 + req.extra_links,
         100 + req.extra_clicks * 10,
@@ -291,7 +311,7 @@ pub async fn init_enterprise_payment(
         &state.db,
         member_id,
         "enterprise",
-        "monthly",
+        &req.billing_cycle,
         &payment_amount,
         "TL",
         "",
@@ -412,9 +432,11 @@ pub async fn schedule_downgrade(
             .await
             .map_err(anyhow::Error::from)?;
     } else {
-        let new_amount = plan_amount_tl(&new_plan)
+        // Yeni planın tutarı mevcut aboneliğin dönemine göre (yıllık abonelik yıllık yenilenir).
+        let new_amount = plan_amount_kurus(&new_plan, &active_sub.billing_cycle)
+            .map(format_tl)
             .ok_or_else(|| AppError::BadRequest(format!("Geçersiz plan: {}", req.new_plan)))?;
-        subscription_repo::set_scheduled_downgrade(&state.db, active_sub.id, &new_plan, new_amount)
+        subscription_repo::set_scheduled_downgrade(&state.db, active_sub.id, &new_plan, &new_amount)
             .await
             .map_err(anyhow::Error::from)?;
     }
@@ -501,17 +523,27 @@ mod tests {
 
     #[test]
     fn plan_amounts_are_fixed() {
-        assert!(validate_plan_amount("silver", "149.00").is_ok());
-        assert!(validate_plan_amount("gold", "299.00").is_ok());
-        assert!(validate_plan_amount("gold", "149.00").is_err());
-        assert!(validate_plan_amount("enterprise", "1.00").is_err());
-        assert!(validate_plan_amount("Gold", "299.00").is_err());
+        assert!(validate_plan_amount("silver", "monthly", "349.00").is_ok());
+        assert!(validate_plan_amount("gold", "monthly", "899.00").is_ok());
+        assert!(validate_plan_amount("gold", "monthly", "299.00").is_err());
+        assert!(validate_plan_amount("enterprise", "monthly", "1.00").is_err());
+        assert!(validate_plan_amount("Gold", "monthly", "899.00").is_err());
     }
 
     #[test]
-    fn only_monthly_tl_card_single_payment() {
+    fn yearly_is_twelve_months_minus_twenty_percent() {
+        assert!(validate_plan_amount("silver", "yearly", "3350.40").is_ok());
+        assert!(validate_plan_amount("gold", "yearly", "8630.40").is_ok());
+        // Yıllık abonelik aylık fiyata alınamaz
+        assert!(validate_plan_amount("gold", "yearly", "899.00").is_err());
+        assert!(validate_plan_amount("gold", "weekly", "899.00").is_err());
+    }
+
+    #[test]
+    fn payment_terms() {
         assert!(validate_payment_terms("monthly", "TL", "card", 0).is_ok());
-        assert!(validate_payment_terms("yearly", "TL", "card", 0).is_err());
+        assert!(validate_payment_terms("yearly", "TL", "card", 0).is_ok());
+        assert!(validate_payment_terms("weekly", "TL", "card", 0).is_err());
         assert!(validate_payment_terms("monthly", "USD", "card", 0).is_err());
         assert!(validate_payment_terms("monthly", "TL", "eft", 0).is_err());
         assert!(validate_payment_terms("monthly", "TL", "card", 3).is_err());
@@ -519,20 +551,21 @@ mod tests {
 
     #[test]
     fn enterprise_price_rejects_negative_and_huge() {
-        assert_eq!(enterprise_price_kurus(1, 0, 0).unwrap(), 99_900);
-        assert!(enterprise_price_kurus(1, -9, -1).is_err());
-        assert!(enterprise_price_kurus(0, 0, 0).is_err());
-        assert!(enterprise_price_kurus(-5, 0, 0).is_err());
-        assert!(enterprise_price_kurus(101, 0, 0).is_err());
-        assert!(enterprise_price_kurus(1, 10_001, 0).is_err());
-        assert!(enterprise_price_kurus(1, 0, i32::MAX).is_err());
+        assert_eq!(enterprise_price_kurus(1, 0, 0, "monthly").unwrap(), 199_900);
+        assert!(enterprise_price_kurus(1, -9, -1, "monthly").is_err());
+        assert!(enterprise_price_kurus(0, 0, 0, "monthly").is_err());
+        assert!(enterprise_price_kurus(-5, 0, 0, "monthly").is_err());
+        assert!(enterprise_price_kurus(101, 0, 0, "monthly").is_err());
+        assert!(enterprise_price_kurus(1, 10_001, 0, "monthly").is_err());
+        assert!(enterprise_price_kurus(1, 0, i32::MAX, "monthly").is_err());
+        assert!(enterprise_price_kurus(1, 0, 0, "weekly").is_err());
     }
 
     #[test]
-    fn enterprise_amount_matches_historic_payment() {
-        // 30 Haziran'daki gerçek ödeme: users=2, extra_links=333, extra_clicks=1333 → 101099.00 TL
-        let k = enterprise_price_kurus(2, 333, 1333).unwrap();
-        assert_eq!(format!("{}.{:02}", k / 100, k % 100), "101099.00");
+    fn enterprise_add_ons_and_yearly() {
+        // 1.999 + 1 ek kullanıcı (150) + 2 link paketi (200) + 3 tıklama paketi (150) = 2.499 TL
+        assert_eq!(format_tl(enterprise_price_kurus(2, 2, 3, "monthly").unwrap()), "2499.00");
+        assert_eq!(format_tl(enterprise_price_kurus(2, 2, 3, "yearly").unwrap()), "23990.40");
     }
 
     #[test]
