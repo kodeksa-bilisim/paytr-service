@@ -60,7 +60,9 @@ docker exec -i $PG psql -U postgres -X -q -v ON_ERROR_STOP=1 < "$HERE/customers_
 sql "INSERT INTO customers (member_id,name,email,user_type,subscription_status,subscription_id) VALUES
  (1,'A','a@x.test','Gold','active','101'), (2,'B','fail-b@x.test','Gold','active','201'),
  (3,'C','c@x.test','Silver','active','301'), (4,'D','d@x.test','Gold','active','401'),
- (5,'E','e@x.test','Gold','active','501'), (6,'F','f@x.test','Gold','active','601');"
+ (5,'E','e@x.test','Gold','active','501'), (6,'F','f@x.test','Gold','active','601'),
+ (7,'G','g@x.test','Standard',NULL,NULL), (8,'H','h@x.test','Gold','active','801'),
+ (9,'I','i@x.test','Silver','active','901');"
 
 python3 "$HERE/mock_paytr.py" $MOCK_PORT "$MOCK_LOG" & MOCK_PID=$!
 ( cd "$WORK" && env -i PATH="$PATH" \
@@ -71,14 +73,14 @@ python3 "$HERE/mock_paytr.py" $MOCK_PORT "$MOCK_LOG" & MOCK_PID=$!
     RUST_LOG=payment_service=debug "$ROOT/target/debug/payment-service" > "$SVC_LOG" 2>&1 ) & SVC_PID=$!
 for _ in $(seq 1 30); do curl -s "$BASE/health" >/dev/null && break; sleep 1; done
 
-# Abonelik + kart tohumlama: sub id, member, plan, amount, utoken, bitiş (UTC ifadesi)
+# Abonelik + kart tohumlama: sub id, member, plan, amount, utoken, bitiş (UTC ifadesi) [, dönem]
 seed_sub() {
   sql "INSERT INTO paytr_user_tokens(member_id,utoken) VALUES ($2,'$5') ON CONFLICT DO NOTHING;
        INSERT INTO paytr_cards(utoken,ctoken,last_4,expiry_month,expiry_year,require_cvv,is_default)
          VALUES ('$5','ct$5','1111','12','30',false,true) ON CONFLICT DO NOTHING;
        INSERT INTO paytr_subscriptions(id,member_id,plan,status,utoken,ctoken,billing_cycle,amount,currency,
          started_at,expires_at,next_payment_date,user_email)
-       SELECT $1,$2,'$3','active','$5','ct$5','monthly','$4','TL',$UTC - interval '1 month',$6,$6,email
+       SELECT $1,$2,'$3','active','$5','ct$5','${7:-monthly}','$4','TL',$UTC - interval '1 month',$6,$6,email
        FROM customers WHERE member_id=$2;"
 }
 seed_sub 101 1 gold 299.00 ut1 "$UTC - interval '1 hour'"
@@ -87,6 +89,8 @@ seed_sub 301 3 silver 149.00 ut3 "$UTC + interval '10 days'"
 seed_sub 401 4 gold 299.00 ut4 "$UTC + interval '10 days'"
 seed_sub 501 5 gold 299.00 ut5 "$UTC + interval '10 days'"
 seed_sub 601 6 gold 299.00 ut6 "$UTC + interval '2 hours'"
+seed_sub 801 8 gold 899.00 ut8 "$UTC + interval '10 days'"
+seed_sub 901 9 silver 3350.40 ut9 "$UTC + interval '360 days'" yearly
 sql "SELECT setval('paytr_subscriptions_id_seq', 1000);" >/dev/null
 # 3 gün önce kalmış, callback'i gelmemiş pending ödeme
 sql "INSERT INTO paytr_payments(member_id,subscription_id,merchant_oid,amount,status,created_at)
@@ -94,7 +98,7 @@ sql "INSERT INTO paytr_payments(member_id,subscription_id,merchant_oid,amount,st
 
 echo "== Güvenlik / doğrulama"
 eq "health" "$(curl -s -o /dev/null -w '%{http_code}' $BASE/health)" 200
-INIT='{"member_id":3,"plan":"gold","billing_cycle":"monthly","user_ip":"1.2.3.4","merchant_oid":"u3t1","email":"c@x.test","payment_amount":"299.00","user_name":"C","user_address":"Online","user_phone":"5000000000","user_basket":[{"name":"Gold","price":"299.00","quantity":1}],"merchant_ok_url":"https://nlink.tr/ok","merchant_fail_url":"https://nlink.tr/fail"}'
+INIT='{"member_id":3,"plan":"gold","billing_cycle":"monthly","user_ip":"1.2.3.4","merchant_oid":"u3t1","email":"c@x.test","payment_amount":"899.00","user_name":"C","user_address":"Online","user_phone":"5000000000","user_basket":[{"name":"Gold","price":"899.00","quantity":1}],"merchant_ok_url":"https://nlink.tr/ok","merchant_fail_url":"https://nlink.tr/fail"}'
 eq "init token'sız → 401" "$(post /api/v1/payments/init "$INIT")" 401
 eq "init yanlış token → 401" "$(post /api/v1/payments/init "$INIT" wrong-token)" 401
 eq "init yearly → 400" "$(post /api/v1/payments/init "${INIT/monthly/yearly}" $TOKEN)" 400
@@ -146,14 +150,48 @@ eq "müşteri Standard'a düştü" "$(sql "SELECT user_type||'/'||coalesce(subsc
 eq "kartlar silindi (DB)" "$(sql "SELECT count(*) FROM paytr_cards WHERE utoken='ut2' AND is_active")" 0
 eq "kartlar silindi (PayTR)" "$(grep -c '"path": "/odeme/capi/delete".*"utoken": "ut2"' "$MOCK_LOG")" 1
 
-echo "== Upgrade (Silver → Gold)"
+echo "== Upgrade (Silver → Gold, fark ücreti)"
+eq "upgrade quote → 200" "$(post /api/v1/subscriptions/upgrade-quote '{"member_id":3,"plan":"gold","billing_cycle":"monthly"}' $TOKEN)" 200
+QCHARGE=$(python3 -c "import json;print(json.load(open('$WORK/last.json'))['charge_amount'])")
 eq "upgrade init → 200" "$(post /api/v1/payments/init "$INIT" $TOKEN)" 200
 NEWSUB=$(sql "SELECT id FROM paytr_subscriptions WHERE member_id=3 AND status='pending'")
-eq "upgrade callback → 200" "$(callback u3t1 success 29900 ut3new)" 200
+CHARGE=$(sql "SELECT amount FROM paytr_payments WHERE merchant_oid='u3t1'")
+eq "tahsil edilen = liste − kalan değer (≈10/30 × 149 TL düşüldü)" "$(sql "SELECT '$CHARGE'::numeric BETWEEN 845 AND 855")" t
+eq "teklif ile tahsilat aynı (±1 kuruş, saniye farkı)" "$(sql "SELECT abs('$QCHARGE'::numeric - '$CHARGE'::numeric) <= 0.01")" t
+eq "PayTR formu tahsil tutarını taşıyor" "$(python3 -c "import json;print(json.load(open('$WORK/last.json'))['form_params']['payment_amount'])")" "$CHARGE"
+eq "yenileme tutarı liste fiyatı" "$(sql "SELECT amount||'/'||(metadata->>'upgrade_from') FROM paytr_subscriptions WHERE id=$NEWSUB")" "899.00/301"
+CHARGE_KURUS=$(sql "SELECT (('$CHARGE'::numeric)*100)::int")
+eq "upgrade callback → 200" "$(callback u3t1 success $CHARGE_KURUS ut3new)" 200
 eq "yeni abonelik aktif, kart bağlı" "$(sql "SELECT status||'/'||ctoken FROM paytr_subscriptions WHERE id=$NEWSUB")" "active/ctut3new"
 eq "eski abonelik replaced" "$(sql "SELECT status FROM paytr_subscriptions WHERE id=301")" replaced
-eq "kalan süre aktarıldı (≈10 gün + 1 ay)" "$(sql "SELECT expires_at > $UTC + interval '1 month 9 days' FROM paytr_subscriptions WHERE id=$NEWSUB")" t
+eq "yeni dönem hemen başladı (1 ay, süre aktarılmadı)" "$(sql "SELECT expires_at BETWEEN $UTC + interval '1 month' - interval '1 hour' AND $UTC + interval '1 month' + interval '1 hour' FROM paytr_subscriptions WHERE id=$NEWSUB")" t
 eq "müşteri Gold" "$(sql "SELECT user_type||'/'||subscription_id FROM customers WHERE member_id=3")" "Gold/$NEWSUB"
+
+echo "== Geç callback'ler müşteri planını ezmez"
+sql "INSERT INTO paytr_payments(member_id,subscription_id,merchant_oid,amount,is_3d) VALUES (3,301,'late301','149.00',false)"
+eq "replaced aboneliğe yenileme callback'i → 200" "$(callback late301 success 14900)" 200
+eq "ödeme review, müşteri hâlâ Gold" "$(sql "SELECT p.status||'/'||c.user_type||'/'||c.subscription_id FROM paytr_payments p, customers c WHERE p.merchant_oid='late301' AND c.member_id=3")" "review/Gold/$NEWSUB"
+INIT7='{"member_id":7,"plan":"silver","billing_cycle":"monthly","user_ip":"1.2.3.4","merchant_oid":"u7a","email":"g@x.test","payment_amount":"349.00","user_name":"G","user_address":"Online","user_phone":"5000000000","user_basket":[{"name":"Silver","price":"349.00","quantity":1}],"merchant_ok_url":"https://nlink.tr/ok","merchant_fail_url":"https://nlink.tr/fail"}'
+post /api/v1/payments/init "$INIT7" $TOKEN >/dev/null
+post /api/v1/payments/init "${INIT7/u7a/u7b}" $TOKEN >/dev/null
+SUB7B=$(sql "SELECT subscription_id FROM paytr_payments WHERE merchant_oid='u7b'")
+callback u7b success 34900 ut7 >/dev/null
+eq "ikinci sekmedeki ödeme aktifleşti" "$(sql "SELECT status FROM paytr_subscriptions WHERE id=$SUB7B")" active
+eq "iptal edilmiş ilk ödeme sonradan tamamlanınca → 200" "$(callback u7a success 34900 ut7)" 200
+eq "ilk ödeme review, yeni abonelik yerinde" "$(sql "SELECT p.status||'/'||s.status||'/'||c.subscription_id FROM paytr_payments p, paytr_subscriptions s, customers c WHERE p.merchant_oid='u7a' AND s.id=$SUB7B AND c.member_id=7")" "review/active/$SUB7B"
+eq "tekrar gelen review callback'i yine 200" "$(callback u7a success 34900 ut7)" 200
+
+echo "== Fark ücreti sınırları"
+eq "iptal edilmiş geçerli abonelik: aynı plan tekrar alınamaz" "$(post /api/v1/subscriptions/cancel '{"member_id":8,"subscription_id":801}' $TOKEN; post /api/v1/payments/init "$(echo "$INIT" | sed 's/"member_id":3/"member_id":8/; s/u3t1/u8t1/')" $TOKEN)" "204400"
+eq "Silver yıllık → Gold aylık: kalan değer yetiyor → 400" "$(post /api/v1/payments/init "$(echo "$INIT" | sed 's/"member_id":3/"member_id":9/; s/u3t1/u9t1/')" $TOKEN)" 400
+post /api/v1/subscriptions/upgrade-quote '{"member_id":9,"plan":"gold","billing_cycle":"yearly"}' $TOKEN >/dev/null
+eq "Silver yıllık → Gold yıllık: fark ≈ 8630,40 − ~3300" "$(python3 -c "import json;print(5200 < float(json.load(open('$WORK/last.json'))['charge_amount']) < 5400)")" True
+eq "Silver yıllık → Enterprise aylık: kalan değer yetiyor → 400" "$(post /api/v1/subscriptions/upgrade-quote '{"member_id":9,"plan":"enterprise","billing_cycle":"monthly","users":1,"extra_links":0,"extra_clicks":0}' $TOKEN)" 400
+
+echo "== Abonelik başına tek pending ödeme"
+sql "INSERT INTO paytr_payments(member_id,subscription_id,merchant_oid,amount) VALUES (4,401,'dupA','299.00')"
+eq "ikinci pending reddedilir" "$(sql "INSERT INTO paytr_payments(member_id,subscription_id,merchant_oid,amount) VALUES (4,401,'dupB','299.00')" 2>&1 | grep -c uniq_paytr_payments_pending_per_subscription)" 1
+sql "DELETE FROM paytr_payments WHERE merchant_oid='dupA'"
 eq "aynı planı tekrar satın alma → 400" "$(post /api/v1/payments/init "${INIT/u3t1/u3t2}" $TOKEN)" 400
 sql "UPDATE paytr_subscriptions SET expires_at=$UTC - interval '1 hour' WHERE id=301"
 tick
@@ -170,12 +208,13 @@ post /api/v1/subscriptions/reactivate '{"member_id":3}' $TOKEN >/dev/null
 eq "upgrade sonrası geri alma yalnızca güncel aboneliği canlandırır" "$(sql "SELECT count(*) FILTER (WHERE status='active')||'/'||(SELECT status FROM paytr_subscriptions WHERE id=301) FROM paytr_subscriptions WHERE member_id=3")" "1/replaced"
 
 echo "== Ücretsiz plana geçiş"
+eq "önce silver'a downgrade → 200" "$(post /api/v1/subscriptions/schedule-downgrade '{"member_id":5,"new_plan":"silver"}' $TOKEN)" 200
 eq "standard'a downgrade → 200" "$(post /api/v1/subscriptions/schedule-downgrade '{"member_id":5,"new_plan":"standard"}' $TOKEN)" 200
 eq "abonelik dönem sonunda bitecek şekilde iptal" "$(sql "SELECT s.status||'/'||c.scheduled_plan FROM paytr_subscriptions s JOIN customers c USING(member_id) WHERE s.id=501")" "cancelled/standard"
 eq "downgrade iptali → 200" "$(post /api/v1/subscriptions/cancel-schedule '{"member_id":5}' $TOKEN)" 200
-eq "abonelik tekrar aktif, plan temiz" "$(sql "SELECT s.status||'/'||coalesce(c.scheduled_plan,'null') FROM paytr_subscriptions s JOIN customers c USING(member_id) WHERE s.id=501")" "active/null"
+eq "abonelik tekrar aktif, plan temiz (müşteri ve abonelik)" "$(sql "SELECT s.status||'/'||coalesce(c.scheduled_plan,'null')||'/'||coalesce(s.scheduled_plan,'null') FROM paytr_subscriptions s JOIN customers c USING(member_id) WHERE s.id=501")" "active/null/null"
 
 echo
-grep -iE "panic|ERROR" "$SVC_LOG" | grep -v "Yenileme hatası\|Tahsil edilen tutar" | head -5
+grep -iE "panic|ERROR" "$SVC_LOG" | grep -v "Yenileme hatası\|Tahsil edilen tutar\|incelemeye alındı" | head -5
 echo "== Sonuç: $PASS geçti, $FAIL başarısız"
 [ "$FAIL" = 0 ]

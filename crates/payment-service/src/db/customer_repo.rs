@@ -12,6 +12,17 @@ pub async fn find_name(pool: &PgPool, member_id: i32) -> Option<String> {
         .flatten()
 }
 
+/// Müşterinin güncel abonelik kimliği (`customers.subscription_id`); callback transaction'ı
+/// içinde satırı kilitler. Müşteri ya da abonelik yoksa None.
+pub async fn current_subscription_id_for_update<'e>(ex: impl PgExecutor<'e>, member_id: i32) -> Result<Option<String>> {
+    let id: Option<Option<String>> =
+        sqlx::query_scalar("SELECT subscription_id FROM customers WHERE member_id = $1 FOR UPDATE")
+            .bind(member_id)
+            .fetch_optional(ex)
+            .await?;
+    Ok(id.flatten())
+}
+
 /// plan adını PascalCase'e çevirir ("silver" → "Silver").
 /// qurlbackend Membership enum'ı PascalCase bekler.
 fn plan_to_user_type(plan: &str) -> String {

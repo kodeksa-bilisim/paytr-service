@@ -35,6 +35,9 @@ pub struct Config {
     pub internal_api_token: String,
     /// Email ayarları — tüm SMTP değişkenleri tanımlıysa Some, değilse None.
     pub email: Option<EmailConfig>,
+    /// İnceleme gerektiren ödemeler (tutar uyuşmazlığı, geçersiz aboneliğe tahsilat) bu adrese
+    /// bildirilir (`ALERT_EMAIL`). Tanımlı değilse yalnızca loglanır.
+    pub alert_email: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -110,6 +113,7 @@ impl Config {
                 t
             },
             email: build_email_config(),
+            alert_email: std::env::var("ALERT_EMAIL").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         })
     }
 }

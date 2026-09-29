@@ -8,6 +8,7 @@ mod error;
 mod handlers;
 mod models;
 mod paytr_client;
+mod pricing;
 mod scheduler;
 
 use std::sync::Arc;
@@ -110,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/subscriptions/reactivate", post(handlers::subscription::reactivate_subscription))
         .route("/api/v1/subscriptions/schedule-downgrade", post(handlers::payment::schedule_downgrade))
         .route("/api/v1/subscriptions/cancel-schedule", post(handlers::payment::cancel_scheduled_downgrade))
+        .route("/api/v1/subscriptions/upgrade-quote", post(handlers::payment::upgrade_quote))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&state), require_internal_token));
 
     let app = Router::new()

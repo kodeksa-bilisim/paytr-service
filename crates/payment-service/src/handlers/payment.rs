@@ -7,48 +7,15 @@ use crate::{
     models::payment::{
         BasketItem, CancelScheduleRequest, EnterpriseInitRequest, InitPaymentRequest,
         InitPaymentResponse, PaytrFormParams, ScheduleDowngradeRequest, ScheduleDowngradeResponse,
+        UpgradeQuoteRequest, UpgradeQuoteResponse,
     },
     paytr_client,
+    pricing::{
+        amount_to_kurus, enterprise_price_kurus, format_tl, plan_amount_kurus, plan_rank,
+        unused_credit_kurus, MIN_CHARGE_KURUS,
+    },
     AppState,
 };
-
-/// Planın sıralaması: düşük = düşük plan. Upgrade/downgrade tespiti için.
-fn plan_rank(plan: &str) -> u8 {
-    match plan.to_lowercase().as_str() {
-        "silver"     => 1,
-        "gold"       => 2,
-        "enterprise" => 3,
-        _            => 0, // standard / free
-    }
-}
-
-/// Yıllık faturalandırmada uygulanan indirim (%).
-const YEARLY_DISCOUNT_PCT: i64 = 20;
-
-/// Aylık tutarı faturalandırma dönemine çevirir: yıllık = 12 ay − %20.
-fn cycle_amount_kurus(monthly_kurus: i64, billing_cycle: &str) -> Option<i64> {
-    match billing_cycle {
-        "monthly" => Some(monthly_kurus),
-        "yearly" => Some(monthly_kurus * 12 * (100 - YEARLY_DISCOUNT_PCT) / 100),
-        _ => None,
-    }
-}
-
-/// Plan ve döneme karşılık gelen tutar (kuruş). Fiyat tablosu yalnızca burada tanımlı;
-/// mevcut abonelikler yenilemede kayıtlı tutarlarıyla devam eder.
-fn plan_amount_kurus(plan: &str, billing_cycle: &str) -> Option<i64> {
-    let monthly = match plan {
-        "silver" => 34_900,
-        "gold" => 89_900,
-        _ => return None,
-    };
-    cycle_amount_kurus(monthly, billing_cycle)
-}
-
-/// Kuruşu PayTR'ın beklediği TL biçimine çevirir: 34900 → "349.00".
-fn format_tl(kurus: i64) -> String {
-    format!("{}.{:02}", kurus / 100, kurus % 100)
-}
 
 /// Redirect URL'nin güvenli olduğunu doğrular: yalnızca https:// kabul edilir.
 fn validate_redirect_url(url: &str, field: &str) -> Result<(), AppError> {
@@ -60,18 +27,18 @@ fn validate_redirect_url(url: &str, field: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Plan ile tutar uyumunu doğrular — frontend manipülasyonunu önler.
-fn validate_plan_amount(plan: &str, billing_cycle: &str, amount: &str) -> Result<(), AppError> {
+/// Plan ile tutar uyumunu doğrular — frontend manipülasyonunu önler. İstekteki tutar planın
+/// liste fiyatıdır; yükseltmede tahsil edilen tutar sunucuda ayrıca hesaplanır.
+fn validate_plan_amount(plan: &str, billing_cycle: &str, amount: &str) -> Result<i64, AppError> {
     let expected = plan_amount_kurus(plan, billing_cycle)
-        .map(format_tl)
         .ok_or_else(|| AppError::BadRequest(format!("Geçersiz plan: {}", plan)))?;
-    if amount != expected {
+    if amount != format_tl(expected) {
         return Err(AppError::BadRequest(format!(
             "Tutar plan ile uyuşmuyor (beklenen: {} TL)",
-            expected
+            format_tl(expected)
         )));
     }
-    Ok(())
+    Ok(expected)
 }
 
 /// Ödeme koşulları: aylık/yıllık, TL, tek çekim. Tutar `validate_plan_amount` ile döneme
@@ -97,37 +64,124 @@ fn validate_payment_terms(
     Ok(())
 }
 
-const ENTERPRISE_MAX_USERS: i32 = 100;
-const ENTERPRISE_MAX_EXTRA: i32 = 10_000;
+/// Yeni satın alma / yükseltme için tahsil edilecek tutar.
+struct Charge {
+    /// Planın dönem liste fiyatı (yenilemelerde bu tutar çekilir).
+    list_kurus: i64,
+    /// Mevcut aboneliğin kullanılmamış kısmının değeri (yükseltmede düşülür).
+    credit_kurus: i64,
+    /// Bu ödemede tahsil edilen: liste − kredi.
+    charge_kurus: i64,
+    /// Yükseltilen abonelik (plan, bitiş).
+    from: Option<(i32, String, Option<chrono::NaiveDateTime>)>,
+}
 
-/// Enterprise aylık fiyatı (kuruş). Negatif/aşırı değerler reddedilir — aksi halde
-/// `extra_links=-9` gibi değerlerle fiyat düşürülebiliyordu.
-fn enterprise_price_kurus(users: i32, extra_links: i32, extra_clicks: i32, billing_cycle: &str) -> Result<i64, AppError> {
-    if !(1..=ENTERPRISE_MAX_USERS).contains(&users) {
+impl Charge {
+    /// Abonelik metadata'sına yazılan yükseltme bilgisi (callback yalnızca bu aboneliğin
+    /// yerini almaya izin verir).
+    fn metadata(&self) -> Option<serde_json::Value> {
+        self.from.as_ref().map(|(id, _, _)| {
+            serde_json::json!({
+                "upgrade_from": id,
+                "list_amount": format_tl(self.list_kurus),
+                "credit_amount": format_tl(self.credit_kurus),
+            })
+        })
+    }
+}
+
+/// Fark ücreti: üyenin geçerli aboneliği (aktif ya da süresi dolmamış iptal) varsa, yalnızca
+/// daha üst bir plana geçilebilir ve eski dönemin kullanılmamış değeri yeni plan tutarından
+/// düşülür; yeni dönem ödemeyle birlikte başlar. (Eskiden kalan süre olduğu gibi üst plana
+/// aktarılıyordu: Silver yıllık + Gold aylık ile ~13 ay Gold alınabiliyordu.)
+async fn compute_charge(state: &crate::AppData, member_id: i32, target_plan: &str, list_kurus: i64) -> Result<Charge, AppError> {
+    let Some(cur) = subscription_repo::find_live(&state.db, member_id)
+        .await
+        .map_err(anyhow::Error::from)?
+    else {
+        return Ok(Charge { list_kurus, credit_kurus: 0, charge_kurus: list_kurus, from: None });
+    };
+
+    if plan_rank(target_plan) <= plan_rank(&cur.plan) {
+        let msg = match (cur.status.as_str(), plan_rank(target_plan) == plan_rank(&cur.plan)) {
+            ("cancelled", true) => "İptal ettiğiniz abonelik dönem sonuna kadar geçerli. Devam etmek için iptali geri alın.",
+            ("cancelled", false) => "Mevcut aboneliğiniz dönem sonuna kadar geçerli; daha düşük bir plana dönem bitiminden sonra geçebilirsiniz.",
+            _ => "Bu plan ya da daha üstü zaten aktif. Plan düşürmek için plan değişikliğini kullanın.",
+        };
+        return Err(AppError::BadRequest(msg.to_string()));
+    }
+
+    // Eski aboneliğin yenileme ödemesi sürüyorsa bekle: aksi halde hem yenileme hem yükseltme tahsil edilir.
+    if payment_repo::has_pending(&state.db, cur.id).await.map_err(anyhow::Error::from)? {
+        return Err(AppError::BadRequest(
+            "Mevcut aboneliğinizin yenileme ödemesi işleniyor; lütfen birkaç dakika sonra tekrar deneyin.".to_string(),
+        ));
+    }
+
+    let now = chrono::Utc::now().naive_utc();
+    let credit_kurus = match (amount_to_kurus(&cur.amount), cur.expires_at) {
+        (Some(paid), Some(exp)) => unused_credit_kurus(paid, &cur.billing_cycle, exp, now),
+        _ => 0,
+    };
+    let charge_kurus = list_kurus - credit_kurus;
+    if charge_kurus < MIN_CHARGE_KURUS {
         return Err(AppError::BadRequest(format!(
-            "Kullanıcı sayısı 1–{} arasında olmalı",
-            ENTERPRISE_MAX_USERS
+            "Mevcut aboneliğinizin kalan değeri ({} TL) seçilen planın tutarını karşılıyor; daha uzun bir dönem seçin.",
+            format_tl(credit_kurus)
         )));
     }
-    if !(0..=ENTERPRISE_MAX_EXTRA).contains(&extra_links) || !(0..=ENTERPRISE_MAX_EXTRA).contains(&extra_clicks) {
-        return Err(AppError::BadRequest(format!(
-            "Ek link/tıklama paketi 0–{} arasında olmalı",
-            ENTERPRISE_MAX_EXTRA
-        )));
+    Ok(Charge { list_kurus, credit_kurus, charge_kurus, from: Some((cur.id, cur.plan, cur.expires_at)) })
+}
+
+/// Yükseltmede sepet tek kalem: tahsil edilen fark tutarı (PayTR sepeti tutarla uyuşmalı).
+fn upgrade_basket(label: &str, charge: &Charge) -> Vec<BasketItem> {
+    vec![BasketItem {
+        name: format!("{label} - yükseltme (kalan süre düşüldü)"),
+        price: format_tl(charge.charge_kurus),
+        quantity: 1,
+    }]
+}
+
+/// PayTR `debug_on` yalnızca test modunda iletilir (canlıda hata ayrıntısı kullanıcıya gösterilmesin).
+fn debug_flag(state: &crate::AppData, requested: Option<u8>) -> Option<u8> {
+    if state.config.test_mode == 1 { requested } else { None }
+}
+
+/// POST /api/v1/subscriptions/upgrade-quote — ödeme öncesi kullanıcıya gösterilecek tutar.
+pub async fn upgrade_quote(
+    State(state): State<AppState>,
+    Json(req): Json<UpgradeQuoteRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if req.member_id <= 0 {
+        return Err(AppError::BadRequest("Geçersiz member_id".to_string()));
     }
-    let monthly = 199_900
-        + (users as i64 - 1) * 15_000
-        + extra_links as i64 * 10_000
-        + extra_clicks as i64 * 5_000;
-    cycle_amount_kurus(monthly, billing_cycle)
-        .ok_or_else(|| AppError::BadRequest("Geçersiz faturalandırma dönemi".to_string()))
+    let list_kurus = if req.plan == "enterprise" {
+        enterprise_price_kurus(
+            req.users.unwrap_or(1),
+            req.extra_links.unwrap_or(0),
+            req.extra_clicks.unwrap_or(0),
+            &req.billing_cycle,
+        )
+        .map_err(AppError::BadRequest)?
+    } else {
+        plan_amount_kurus(&req.plan, &req.billing_cycle)
+            .ok_or_else(|| AppError::BadRequest(format!("Geçersiz plan ya da dönem: {} / {}", req.plan, req.billing_cycle)))?
+    };
+    let c = compute_charge(&state, req.member_id, &req.plan, list_kurus).await?;
+    Ok(Json(UpgradeQuoteResponse {
+        list_amount: format_tl(c.list_kurus),
+        credit_amount: format_tl(c.credit_kurus),
+        charge_amount: format_tl(c.charge_kurus),
+        from_plan: c.from.as_ref().map(|(_, p, _)| p.clone()),
+        from_expires_at: c.from.as_ref().and_then(|(_, _, e)| e.map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string())),
+    }))
 }
 
 pub async fn init_payment(
     State(state): State<AppState>,
     Json(req): Json<InitPaymentRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    validate_plan_amount(&req.plan, &req.billing_cycle, &req.payment_amount)?;
+    let list_kurus = validate_plan_amount(&req.plan, &req.billing_cycle, &req.payment_amount)?;
     validate_payment_terms(&req.billing_cycle, &req.currency, &req.payment_type, req.installment_count)?;
     validate_redirect_url(&req.merchant_ok_url, "merchant_ok_url")?;
     validate_redirect_url(&req.merchant_fail_url, "merchant_fail_url")?;
@@ -136,34 +190,25 @@ pub async fn init_payment(
     }
     let member_id = req.member_id;
 
-    let user_basket = encode_basket(&req.user_basket)
-        .map_err(|e| AppError::BadRequest(format!("Sepet hatası: {}", e)))?;
+    // Aynı ya da daha düşük plan yeni ödemeyle alınamaz (düşük plana geçiş schedule-downgrade
+    // ile); üst plana geçişte eski dönemin kalan değeri düşülür.
+    let charge = compute_charge(&state, member_id, &req.plan, list_kurus).await?;
+    let charge_amount = format_tl(charge.charge_kurus);
 
-    // Upgrade ise mevcut aktif aboneliğin bitiş tarihini metadata'ya kaydet (kalan süre aktarılır).
-    // Aynı ya da daha düşük plan yeni ödemeyle alınamaz (kalan süre sessizce yanardı);
-    // düşük plana geçiş schedule-downgrade ile yapılır.
-    let active_sub = subscription_repo::find_active(&state.db, member_id)
-        .await
-        .map_err(anyhow::Error::from)?;
-
-    let metadata = match active_sub.as_ref() {
-        Some(sub) if plan_rank(&req.plan) <= plan_rank(&sub.plan) => {
-            return Err(AppError::BadRequest(
-                "Bu plan ya da daha üstü zaten aktif. Plan düşürmek için plan değişikliğini kullanın.".to_string(),
-            ));
-        }
-        Some(sub) => sub.expires_at.map(|exp| {
-            serde_json::json!({ "previous_expires_at": exp.format("%Y-%m-%dT%H:%M:%S").to_string() })
-        }),
-        None => None,
+    let basket_items = if charge.from.is_some() {
+        upgrade_basket(&format!("{} Plan", crate::email_templates::plan_label(&req.plan)), &charge)
+    } else {
+        req.user_basket
     };
+    let user_basket = encode_basket(&basket_items)
+        .map_err(|e| AppError::BadRequest(format!("Sepet hatası: {}", e)))?;
 
     // Mevcut pending aboneliği temizle (tekrar tıklama / modal yeniden açma)
     subscription_repo::cancel_pending(&state.db, member_id)
         .await
         .map_err(anyhow::Error::from)?;
 
-    // Pending abonelik oluştur
+    // Pending abonelik: tutarı liste fiyatı (yenilemelerde çekilen).
     let subscription = subscription_repo::create(
         &state.db,
         member_id,
@@ -173,7 +218,7 @@ pub async fn init_payment(
         &req.currency,
         &req.user_phone,
         &req.email,
-        metadata,
+        charge.metadata(),
     )
     .await
     .map_err(anyhow::Error::from)?;
@@ -186,7 +231,7 @@ pub async fn init_payment(
         &req.user_ip,
         &req.merchant_oid,
         &req.email,
-        &req.payment_amount,
+        &charge_amount,
         &req.payment_type,
         &installment_str,
         &req.currency,
@@ -196,14 +241,14 @@ pub async fn init_payment(
         &state.config.merchant_key,
     );
 
-    // Pending ödeme kaydı oluştur
+    // Pending ödeme kaydı: tahsil edilen tutar (callback'teki tutar kontrolü buna göre).
     let payment = payment_repo::create(
         &state.db,
         payment_repo::NewPayment {
             member_id,
             subscription_id: Some(subscription.id),
             merchant_oid: &req.merchant_oid,
-            amount: &req.payment_amount,
+            amount: &charge_amount,
             currency: &req.currency,
             payment_type: &req.payment_type,
             installment_count: req.installment_count as i32,
@@ -220,6 +265,8 @@ pub async fn init_payment(
         member_id,
         merchant_oid = %req.merchant_oid,
         plan = %req.plan,
+        charge = %charge_amount,
+        credit = %format_tl(charge.credit_kurus),
         "İlk ödeme başlatıldı (3DS)"
     );
 
@@ -229,6 +276,8 @@ pub async fn init_payment(
             payment_id: payment.id,
             subscription_id: subscription.id,
             paytr_endpoint: paytr_client::payment_endpoint(),
+            list_amount: format_tl(charge.list_kurus),
+            credit_amount: format_tl(charge.credit_kurus),
             form_params: PaytrFormParams {
                 merchant_id: state.config.merchant_id.clone(),
                 paytr_token,
@@ -236,7 +285,7 @@ pub async fn init_payment(
                 merchant_oid: req.merchant_oid,
                 email: req.email,
                 payment_type: req.payment_type,
-                payment_amount: req.payment_amount.clone(),
+                payment_amount: charge_amount,
                 installment_count: req.installment_count,
                 no_installment: 1,
                 max_installment: 0,
@@ -252,7 +301,7 @@ pub async fn init_payment(
                 merchant_fail_url: req.merchant_fail_url,
                 lang: req.client_lang,
                 card_type: req.card_type,
-                debug_on: req.debug_on,
+                debug_on: debug_flag(&state, req.debug_on),
             },
         }),
     ))
@@ -269,18 +318,13 @@ pub async fn init_enterprise_payment(
     }
     let member_id = req.member_id;
 
-    let total_kurus = enterprise_price_kurus(req.users, req.extra_links, req.extra_clicks, &req.billing_cycle)?;
-    let payment_amount = format_tl(total_kurus);
+    let list_kurus = enterprise_price_kurus(req.users, req.extra_links, req.extra_clicks, &req.billing_cycle)
+        .map_err(AppError::BadRequest)?;
+    let list_amount = format_tl(list_kurus);
 
-    // Enterprise zaten aktifse yeni ödeme alınmaz (kalan süre yanardı).
-    if let Some(sub) = subscription_repo::find_active(&state.db, member_id)
-        .await
-        .map_err(anyhow::Error::from)?
-    {
-        if plan_rank(&sub.plan) >= plan_rank("enterprise") {
-            return Err(AppError::BadRequest("Enterprise aboneliğiniz zaten aktif.".to_string()));
-        }
-    }
+    // Enterprise zaten geçerliyse yeni ödeme alınmaz; alt plandan geçişte kalan değer düşülür.
+    let charge = compute_charge(&state, member_id, "enterprise", list_kurus).await?;
+    let charge_amount = format_tl(charge.charge_kurus);
 
     let basket_label = format!(
         "Enterprise Plan{} ({} kullanıcı, {}k link/ay, {}k tıklama/ay)",
@@ -289,19 +333,22 @@ pub async fn init_enterprise_payment(
         10 + req.extra_links,
         100 + req.extra_clicks * 10,
     );
-    let basket_items = vec![BasketItem {
-        name: basket_label,
-        price: payment_amount.clone(),
-        quantity: 1,
-    }];
+    let basket_items = if charge.from.is_some() {
+        upgrade_basket(&basket_label, &charge)
+    } else {
+        vec![BasketItem { name: basket_label, price: charge_amount.clone(), quantity: 1 }]
+    };
     let user_basket = encode_basket(&basket_items)
         .map_err(|e| AppError::BadRequest(format!("Sepet hatası: {}", e)))?;
 
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "users": req.users,
         "extra_links": req.extra_links,
         "extra_clicks": req.extra_clicks,
     });
+    if let (Some(serde_json::Value::Object(up)), Some(m)) = (charge.metadata(), metadata.as_object_mut()) {
+        m.extend(up);
+    }
 
     subscription_repo::cancel_pending(&state.db, member_id)
         .await
@@ -312,7 +359,7 @@ pub async fn init_enterprise_payment(
         member_id,
         "enterprise",
         &req.billing_cycle,
-        &payment_amount,
+        &list_amount,
         "TL",
         "",
         &req.email,
@@ -329,7 +376,7 @@ pub async fn init_enterprise_payment(
         &req.user_ip,
         &req.merchant_oid,
         &req.email,
-        &payment_amount,
+        &charge_amount,
         "card",
         &installment_str,
         "TL",
@@ -345,7 +392,7 @@ pub async fn init_enterprise_payment(
             member_id,
             subscription_id: Some(subscription.id),
             merchant_oid: &req.merchant_oid,
-            amount: &payment_amount,
+            amount: &charge_amount,
             currency: "TL",
             payment_type: "card",
             installment_count: 0,
@@ -361,7 +408,8 @@ pub async fn init_enterprise_payment(
     tracing::info!(
         member_id,
         merchant_oid = %req.merchant_oid,
-        amount = %payment_amount,
+        amount = %charge_amount,
+        credit = %format_tl(charge.credit_kurus),
         "Enterprise ödeme başlatıldı"
     );
 
@@ -371,6 +419,8 @@ pub async fn init_enterprise_payment(
             payment_id: payment.id,
             subscription_id: subscription.id,
             paytr_endpoint: paytr_client::payment_endpoint(),
+            list_amount,
+            credit_amount: format_tl(charge.credit_kurus),
             form_params: PaytrFormParams {
                 merchant_id: state.config.merchant_id.clone(),
                 paytr_token,
@@ -378,7 +428,7 @@ pub async fn init_enterprise_payment(
                 merchant_oid: req.merchant_oid,
                 email: req.email,
                 payment_type: "card".to_string(),
-                payment_amount,
+                payment_amount: charge_amount,
                 installment_count: 0,
                 no_installment: 1,
                 max_installment: 0,
@@ -394,7 +444,7 @@ pub async fn init_enterprise_payment(
                 merchant_fail_url: req.merchant_fail_url,
                 lang: req.client_lang,
                 card_type: req.card_type,
-                debug_on: req.debug_on,
+                debug_on: debug_flag(&state, req.debug_on),
             },
         }),
     ))
@@ -550,28 +600,13 @@ mod tests {
     }
 
     #[test]
-    fn enterprise_price_rejects_negative_and_huge() {
-        assert_eq!(enterprise_price_kurus(1, 0, 0, "monthly").unwrap(), 199_900);
-        assert!(enterprise_price_kurus(1, -9, -1, "monthly").is_err());
-        assert!(enterprise_price_kurus(0, 0, 0, "monthly").is_err());
-        assert!(enterprise_price_kurus(-5, 0, 0, "monthly").is_err());
-        assert!(enterprise_price_kurus(101, 0, 0, "monthly").is_err());
-        assert!(enterprise_price_kurus(1, 10_001, 0, "monthly").is_err());
-        assert!(enterprise_price_kurus(1, 0, i32::MAX, "monthly").is_err());
-        assert!(enterprise_price_kurus(1, 0, 0, "weekly").is_err());
-    }
-
-    #[test]
-    fn enterprise_add_ons_and_yearly() {
-        // 1.999 + 1 ek kullanıcı (150) + 2 link paketi (200) + 3 tıklama paketi (150) = 2.499 TL
-        assert_eq!(format_tl(enterprise_price_kurus(2, 2, 3, "monthly").unwrap()), "2499.00");
-        assert_eq!(format_tl(enterprise_price_kurus(2, 2, 3, "yearly").unwrap()), "23990.40");
-    }
-
-    #[test]
-    fn plan_ranks() {
-        assert!(plan_rank("gold") > plan_rank("silver"));
-        assert!(plan_rank("enterprise") > plan_rank("gold"));
-        assert_eq!(plan_rank("standard"), 0);
+    fn upgrade_metadata_names_its_source() {
+        let c = Charge { list_kurus: 89_900, credit_kurus: 17_450, charge_kurus: 72_450, from: Some((7, "silver".into(), None)) };
+        let m = c.metadata().unwrap();
+        assert_eq!(m["upgrade_from"], 7);
+        assert_eq!(m["credit_amount"], "174.50");
+        assert_eq!(upgrade_basket("Gold Plan", &c)[0].price, "724.50");
+        let fresh = Charge { list_kurus: 89_900, credit_kurus: 0, charge_kurus: 89_900, from: None };
+        assert!(fresh.metadata().is_none());
     }
 }

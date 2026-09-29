@@ -92,18 +92,27 @@ pub async fn set_success<'e>(ex: impl PgExecutor<'e>, merchant_oid: &str) -> Res
     Ok(())
 }
 
-/// Tutar tutarsızlığı gibi elle incelenmesi gereken ödemeler.
-pub async fn set_review(pool: &PgPool, merchant_oid: &str, reason: &str) -> Result<()> {
-    sqlx::query(
+/// Tahsil edilmiş ama otomatik işlenemeyen ödemeyi elle incelemeye alır (tutar tutarsızlığı,
+/// artık geçerli olmayan aboneliğe gelen ödeme vb.). Sync yanıtında `failed` işaretlenmiş
+/// ödemenin sonradan gelen başarılı callback'i de kapsanır. Dönüş: güncellendi mi.
+pub async fn set_review<'e>(ex: impl PgExecutor<'e>, merchant_oid: &str, reason: &str) -> Result<bool> {
+    let r = sqlx::query(
         "UPDATE paytr_payments
          SET status = 'review', failed_reason_msg = $1, callback_received_at = NOW()
-         WHERE merchant_oid = $2 AND status = 'pending'",
+         WHERE merchant_oid = $2 AND status IN ('pending', 'failed')",
     )
     .bind(reason)
     .bind(merchant_oid)
-    .execute(pool)
+    .execute(ex)
     .await?;
-    Ok(())
+    Ok(r.rows_affected() > 0)
+}
+
+/// Veritabanı tekil kısıt ihlali mi? (ör. abonelik başına tek pending ödeme indeksi)
+pub fn is_unique_violation(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<sqlx::Error>()
+        .and_then(|e| e.as_database_error())
+        .is_some_and(|d| d.code().as_deref() == Some("23505"))
 }
 
 /// Bekleyen ödemeyi başarısız işaretler. Yalnızca ilk bildirim etkili olur (PayTR aynı

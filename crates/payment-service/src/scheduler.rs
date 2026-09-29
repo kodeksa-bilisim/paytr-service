@@ -64,10 +64,18 @@ pub async fn process_due(state: &AppState) -> anyhow::Result<()> {
     }
 
     for sub in &due {
-        // Deneme zamanı önce yazılır: PayTR'a ulaşılamasa bile aynı gün tekrar denenmez.
-        if let Err(e) = subscription_repo::mark_renewal_attempt(&state.db, sub.subscription_id).await {
-            tracing::error!(subscription_id = sub.subscription_id, "Deneme zamanı yazılamadı, atlandı: {:?}", e);
-            continue;
+        // Deneme önce sahiplenilir (koşullu): PayTR'a ulaşılamasa bile aynı gün tekrar denenmez,
+        // aynı anda çalışan ikinci bir süreç de aynı aboneliği çekemez.
+        match subscription_repo::claim_renewal_attempt(&state.db, sub.subscription_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(subscription_id = sub.subscription_id, "Yenileme başka bir süreçte, atlandı");
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(subscription_id = sub.subscription_id, "Deneme zamanı yazılamadı, atlandı: {:?}", e);
+                continue;
+            }
         }
 
         match charge(state, sub).await {
@@ -232,8 +240,9 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
         &state.config.merchant_key,
     );
 
-    // Pending ödeme kaydı oluştur
-    payment_repo::create(
+    // Pending ödeme kaydı oluştur. Abonelik başına tek pending (migration 0009): yarışta
+    // ikinci kayıt reddedilir ve PayTR'a istek gitmez.
+    if let Err(e) = payment_repo::create(
         &state.db,
         payment_repo::NewPayment {
             member_id: sub.member_id,
@@ -249,7 +258,14 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
             ctoken: Some(&sub.ctoken),
         },
     )
-    .await?;
+    .await
+    {
+        if payment_repo::is_unique_violation(&e) {
+            tracing::warn!(subscription_id = sub.subscription_id, "Beklemede ödeme mevcut (eşzamanlı), atlandı");
+            return Ok(());
+        }
+        return Err(e);
+    }
 
     let basket = build_basket(&sub.plan, &sub.amount)?;
     let ok_url = format!("{}/api/v1/payments/ok", state.config.base_url);

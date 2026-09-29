@@ -1,9 +1,8 @@
 use axum::{extract::State, response::IntoResponse, Form};
-use chrono::Months;
 
 use crate::{
     crypto::{generate_card_list_token, verify_callback_hash},
-    db::{card_repo, customer_repo, payment_repo, subscription_repo},
+    db::{card_repo, customer_repo, models::PaytrSubscription, payment_repo, subscription_repo},
     email, email_templates,
     error::AppError,
     models::{
@@ -11,6 +10,7 @@ use crate::{
         card::CardItem,
     },
     paytr_client,
+    pricing::{amount_to_kurus, billing_dates},
     AppState,
 };
 
@@ -47,19 +47,41 @@ pub async fn payment_callback(
     Ok("OK")
 }
 
-/// Kayıtlı TL tutarını kuruşa çevirir ("149.00" → 14900). Eski (noktasız) kayıtlar
-/// kuruş kabul edilir.
-fn amount_to_kurus(amount: &str) -> Option<i64> {
-    let a = amount.trim();
-    match a.split_once('.') {
-        Some((tl, kr)) if !kr.is_empty() && kr.len() <= 2 => {
-            let tl: i64 = tl.parse().ok()?;
-            let kr: i64 = format!("{:0<2}", kr).parse().ok()?;
-            Some(tl * 100 + kr)
-        }
-        Some(_) => None,
-        None => a.parse().ok(),
-    }
+/// İlk ödeme aktivasyonu çakışıyor mu? Üyenin başka geçerli aboneliği yalnızca bu ödemenin
+/// yükselttiği abonelikse (`metadata.upgrade_from`) aktivasyon serbesttir. Aksi halde iki ayrı
+/// satın alma tamamlanmış demektir (ör. iki sekmede ödeme; ya da yeni ödeme başlatılınca iptal
+/// edilen eski ödeme sonradan tamamlandı) — yeni aboneliği `replaced` yapmak yerine incelenir.
+fn first_payment_conflicts(sub: &PaytrSubscription, others: &[PaytrSubscription]) -> bool {
+    let meta = sub.metadata.as_ref();
+    let upgrade_from = meta.and_then(|m| m.get("upgrade_from")?.as_i64());
+    // Eski kayıtlar: yükseltme `previous_expires_at` ile işaretlenirdi; o anki (daha eski) abonelik.
+    let legacy_upgrade = upgrade_from.is_none() && meta.is_some_and(|m| m.get("previous_expires_at").is_some());
+    others.iter().any(|o| {
+        let allowed = upgrade_from == Some(o.id as i64) || (legacy_upgrade && o.created_at < sub.created_at);
+        !allowed
+    })
+}
+
+/// Yöneticiye inceleme uyarısı (e-posta yapılandırılmamışsa yalnızca log).
+async fn alert_review(state: &crate::AppData, reason: &str, payload: &CallbackPayload, member_id: i32, subscription_id: Option<i32>) {
+    tracing::error!(
+        merchant_oid = %payload.merchant_oid, member_id, subscription_id, reason,
+        "Ödeme incelemeye alındı — abonelik değiştirilmedi, iade gerekebilir"
+    );
+    let (Some(mailer), Some(email_cfg), Some(to)) = (&state.mailer, &state.config.email, &state.config.alert_email) else {
+        return;
+    };
+    let content = email_templates::payment_review_alert(
+        reason,
+        vec![
+            ("Sipariş no", payload.merchant_oid.clone()),
+            ("Tahsil edilen (kuruş)", payload.total_amount.clone()),
+            ("Üye", member_id.to_string()),
+            ("Abonelik", subscription_id.map_or("-".to_string(), |s| s.to_string())),
+        ],
+        &email_cfg.site_url,
+    );
+    email::send(mailer, email_cfg, to, content).await;
 }
 
 async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Result<(), AppError> {
@@ -72,21 +94,21 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
         tracing::warn!(merchant_oid = %payload.merchant_oid, "Callback geldi fakat ödeme kaydı bulunamadı — görmezden geliniyor");
         return Ok(());
     };
-    if payment.status == "success" {
-        tracing::info!(merchant_oid = %payload.merchant_oid, "Tekrar callback, zaten işlendi");
+    if payment.status == "success" || payment.status == "review" {
+        tracing::info!(merchant_oid = %payload.merchant_oid, status = %payment.status, "Tekrar callback, zaten işlendi");
         return Ok(());
     }
 
     // Savunma derinliği: tahsil edilen tutar (kuruş, taksit farkı dahil) beklenenden az olamaz.
     match (amount_to_kurus(&payment.amount), payload.total_amount.trim().parse::<i64>()) {
         (Some(expected), Ok(paid)) if paid < expected => {
-            tracing::error!(
-                merchant_oid = %payload.merchant_oid, expected, paid,
-                "Tahsil edilen tutar beklenenden düşük — aktivasyon yapılmadı, inceleme gerekli"
-            );
-            payment_repo::set_review(&state.db, &payload.merchant_oid, "amount_mismatch")
+            tracing::error!(merchant_oid = %payload.merchant_oid, expected, paid, "Tahsil edilen tutar beklenenden düşük");
+            if payment_repo::set_review(&state.db, &payload.merchant_oid, "amount_mismatch")
                 .await
-                .map_err(anyhow::Error::from)?;
+                .map_err(anyhow::Error::from)?
+            {
+                alert_review(state, "amount_mismatch", payload, payment.member_id, payment.subscription_id).await;
+            }
             return Ok(());
         }
         (Some(_), Ok(_)) => {}
@@ -143,7 +165,7 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
     else {
         return Ok(());
     };
-    if payment.status == "success" {
+    if payment.status == "success" || payment.status == "review" {
         // Eşzamanlı çift callback: diğeri bizden önce işledi.
         tracing::info!(merchant_oid = %payload.merchant_oid, "Eşzamanlı tekrar callback, zaten işlendi");
         return Ok(());
@@ -169,7 +191,39 @@ async fn handle_success(state: &crate::AppData, payload: &CallbackPayload) -> Re
     // `cancel_pending` ile iptal edilmiş eski pending abonelik de dahil).
     let is_first_payment = sub.started_at.is_none();
 
-    // Upgrade: mevcut aboneliğin kalan süresi yeni plana aktarılır.
+    // Tahsilat artık geçerli olmayan bir aboneliğe geldiyse müşterinin güncel planı ezilmez:
+    // ödeme incelemeye alınır, yönetici uyarılır (iade gerekebilir).
+    let review_reason = if is_first_payment {
+        let others = subscription_repo::live_others_for_update(&mut *tx, member_id, subscription_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        first_payment_conflicts(&sub, &others).then_some("duplicate_purchase")
+    } else if !matches!(sub.status.as_str(), "active" | "cancelled" | "expired") {
+        Some("renewal_on_inactive_subscription")
+    } else {
+        // Süresi dolan abonelikte customers.subscription_id NULL'lanır; başka bir aboneliğe
+        // geçilmişse o abonelik yazılıdır.
+        let current = customer_repo::current_subscription_id_for_update(&mut *tx, member_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        match current {
+            Some(c) if c != subscription_id.to_string() => Some("renewal_not_current_subscription"),
+            _ => None,
+        }
+    };
+    if let Some(reason) = review_reason {
+        let changed = payment_repo::set_review(&mut *tx, &payload.merchant_oid, reason)
+            .await
+            .map_err(anyhow::Error::from)?;
+        tx.commit().await.map_err(anyhow::Error::from)?;
+        if changed {
+            alert_review(state, reason, payload, member_id, Some(subscription_id)).await;
+        }
+        return Ok(());
+    }
+
+    // Eski kayıtlar: yükseltmede önceki aboneliğin kalan süresi aktarılırdı (`previous_expires_at`).
+    // Yeni yükseltmelerde fark ücreti init'te alınır ve yeni dönem hemen başlar.
     let upgrade_start = if is_first_payment {
         sub.metadata.as_ref()
             .and_then(|m| m.get("previous_expires_at")?.as_str())
@@ -395,47 +449,40 @@ async fn fetch_paytr_cards(state: &crate::AppData, utoken: &str) -> Result<Vec<C
     Ok(cards)
 }
 
-/// Fatura döngüsüne göre bitiş ve sonraki ödeme tarihlerini hesaplar.
-/// Yıllık abonelik 12 ay, aylık 1 ay sürer (tutar init'te döneme göre doğrulanır).
-fn billing_dates(
-    billing_cycle: &str,
-    from: chrono::NaiveDateTime,
-) -> (chrono::NaiveDateTime, chrono::NaiveDateTime) {
-    let expires_at = if billing_cycle == "yearly" {
-        from + Months::new(12)
-    } else {
-        from + Months::new(1)
-    };
-    // Sonraki ödeme = bitiş anı; ödeme alınamazsa grace süresince günlük tekrar denenir.
-    (expires_at, expires_at)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn converts_amounts_to_kurus() {
-        assert_eq!(amount_to_kurus("149.00"), Some(14_900));
-        assert_eq!(amount_to_kurus("101099.00"), Some(10_109_900));
-        assert_eq!(amount_to_kurus("12.5"), Some(1_250));
-        assert_eq!(amount_to_kurus("99900"), Some(99_900)); // eski kayıt: kuruş
-        assert_eq!(amount_to_kurus("1.234"), None);
-        assert_eq!(amount_to_kurus("abc"), None);
+    fn sub(id: i32, created_day: u32, metadata: Option<serde_json::Value>) -> PaytrSubscription {
+        let t = chrono::NaiveDate::from_ymd_opt(2026, 9, created_day).unwrap().and_hms_opt(0, 0, 0).unwrap();
+        PaytrSubscription {
+            id, member_id: 1, plan: "gold".into(), status: "active".into(), utoken: None, ctoken: None,
+            billing_cycle: "monthly".into(), amount: "899.00".into(), currency: "TL".into(),
+            user_phone: None, user_email: None, renewal_attempts: 0, started_at: Some(t),
+            expires_at: None, next_payment_date: None, cancelled_at: None, created_at: t, updated_at: t,
+            metadata, scheduled_plan: None, scheduled_amount: None,
+        }
     }
 
     #[test]
-    fn monthly_billing_adds_one_month() {
-        let from = chrono::NaiveDate::from_ymd_opt(2026, 1, 31).unwrap().and_hms_opt(10, 0, 0).unwrap();
-        let (exp, next) = billing_dates("monthly", from);
-        assert_eq!(exp.to_string(), "2026-02-28 10:00:00");
-        assert_eq!(exp, next);
+    fn fresh_purchase_conflicts_with_any_live_subscription() {
+        let new = sub(3, 10, None);
+        assert!(!first_payment_conflicts(&new, &[]));
+        assert!(first_payment_conflicts(&new, &[sub(2, 5, None)]));
     }
 
     #[test]
-    fn yearly_billing_adds_twelve_months() {
-        let from = chrono::NaiveDate::from_ymd_opt(2028, 2, 29).unwrap().and_hms_opt(10, 0, 0).unwrap();
-        let (exp, _) = billing_dates("yearly", from);
-        assert_eq!(exp.to_string(), "2029-02-28 10:00:00");
+    fn upgrade_only_replaces_its_own_source() {
+        let new = sub(3, 10, Some(serde_json::json!({ "upgrade_from": 2 })));
+        assert!(!first_payment_conflicts(&new, &[sub(2, 5, None)]));
+        // Bu arada başka bir satın alma aktifleşmiş → inceleme
+        assert!(first_payment_conflicts(&new, &[sub(2, 5, None), sub(4, 11, None)]));
+    }
+
+    #[test]
+    fn legacy_upgrade_allows_only_older_subscriptions() {
+        let new = sub(3, 10, Some(serde_json::json!({ "previous_expires_at": "2026-10-01T00:00:00" })));
+        assert!(!first_payment_conflicts(&new, &[sub(2, 5, None)]));
+        assert!(first_payment_conflicts(&new, &[sub(4, 11, None)]));
     }
 }
