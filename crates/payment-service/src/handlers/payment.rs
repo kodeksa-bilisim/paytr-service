@@ -301,7 +301,8 @@ pub async fn init_payment(
                 store_card: 1, // Her zaman kartı sakla
                 user_name: req.user_name,
                 user_address: req.user_address,
-                user_phone: req.user_phone,
+                // PayTR telefonu zorunlu tutar; müşterinin numarası yoksa şirket iletişim hattı.
+                user_phone: if req.user_phone.trim().is_empty() { state.config.fallback_phone.clone() } else { req.user_phone },
                 user_basket,
                 merchant_ok_url: req.merchant_ok_url,
                 merchant_fail_url: req.merchant_fail_url,
@@ -450,7 +451,7 @@ pub async fn init_enterprise_payment(
                 store_card: 1,
                 user_name: req.user_name,
                 user_address: "Online".to_string(),
-                user_phone: "5305861333".to_string(),
+                user_phone: state.config.fallback_phone.clone(),
                 user_basket,
                 merchant_ok_url: req.merchant_ok_url,
                 merchant_fail_url: req.merchant_fail_url,

@@ -358,7 +358,7 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Geçersiz abonelik tutarı: {}", sub.amount))?;
     let amount = format_tl(amount_kurus);
 
-    let phone = if sub.user_phone.is_empty() { "5305861333" } else { sub.user_phone.as_str() };
+    let phone = if sub.user_phone.trim().is_empty() { state.config.fallback_phone.as_str() } else { sub.user_phone.as_str() };
 
     let merchant_oid = renewal_merchant_oid(sub.subscription_id, Utc::now().timestamp_millis());
     let test_mode_str = state.config.test_mode.to_string();

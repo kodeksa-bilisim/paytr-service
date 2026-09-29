@@ -1,0 +1,3 @@
+# Satır sonları her platformda LF: bash betikleri CRLF ile çalışmaz, sqlx migration
+# checksum'ları satır sonuna duyarlıdır (CRLF ile derlenen binary uygulanmış migration'ları reddeder).
+* text=auto eol=lf

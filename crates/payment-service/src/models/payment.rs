@@ -23,6 +23,8 @@ pub struct InitPaymentRequest {
     pub currency: String,
     pub user_name: String,
     pub user_address: String,
+    /// Müşterinin telefonu; boşsa PayTR'a `PAYTR_FALLBACK_PHONE` gider.
+    #[serde(default)]
     pub user_phone: String,
     pub user_basket: Vec<BasketItem>,
     pub merchant_ok_url: String,

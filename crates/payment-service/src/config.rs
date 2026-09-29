@@ -38,6 +38,9 @@ pub struct Config {
     /// İnceleme gerektiren ödemeler (tutar uyuşmazlığı, geçersiz aboneliğe tahsilat) bu adrese
     /// bildirilir (`ALERT_EMAIL`). Tanımlı değilse yalnızca loglanır.
     pub alert_email: Option<String>,
+    /// PayTR `user_phone` zorunlu; müşterinin telefonu yoksa gönderilecek şirket iletişim
+    /// numarası (`PAYTR_FALLBACK_PHONE`, varsayılan: sitede yayımlanan WhatsApp hattı).
+    pub fallback_phone: String,
 }
 
 impl std::fmt::Debug for Config {
@@ -114,6 +117,11 @@ impl Config {
             },
             email: build_email_config(),
             alert_email: std::env::var("ALERT_EMAIL").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            fallback_phone: std::env::var("PAYTR_FALLBACK_PHONE")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "5305861333".to_string()),
         })
     }
 }
