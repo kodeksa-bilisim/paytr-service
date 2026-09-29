@@ -3,7 +3,8 @@
 
 - POST /odeme            → sync ödeme yanıtı; e-postada "fail" geçiyorsa reddeder.
 - POST /odeme/capi/list  → utoken için tek kartlık liste.
-- POST /odeme/capi/delete→ başarılı.
+- POST /odeme/capi/delete→ başarılı (utoken'da "bad" geçiyorsa hata).
+- POST /odeme/durum-sorgu → oid'de "paid": başarılı, "refund": başarılı+iade, "unk": geçici hata, diğer: 004.
 Her isteği JSON satırı olarak LOG dosyasına yazar (testler form alanlarını doğrular).
 """
 import json
@@ -37,7 +38,20 @@ class Handler(BaseHTTPRequestHandler):
                 "month": "12", "year": "30", "c_bank": "Test", "c_type": "credit", "schema": "VISA",
             }]
         elif self.path == "/odeme/capi/delete":
-            body = {"status": "success"}
+            if "bad" in form.get("utoken", ""):
+                body = {"status": "error", "err_msg": "silinemedi"}
+            else:
+                body = {"status": "success"}
+        elif self.path == "/odeme/durum-sorgu":
+            oid = form.get("merchant_oid", "")
+            if "refund" in oid:
+                body = {"status": "success", "payment_amount": "299", "payment_total": "299", "returns": [{"return_amount": "299"}]}
+            elif "paid" in oid:
+                body = {"status": "success", "payment_amount": "299", "payment_total": "299", "returns": []}
+            elif "unk" in oid:
+                body = {"status": "error", "err_no": "010", "err_msg": "gecici hata"}
+            else:
+                body = {"status": "error", "err_no": "004", "err_msg": "merchant_oid ile basarili odeme bulunamadi"}
         else:
             self.send_response(404)
             self.end_headers()

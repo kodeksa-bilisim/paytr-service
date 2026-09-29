@@ -4,18 +4,27 @@ use chrono::Utc;
 
 use crate::{
     cards,
-    crypto::generate_payment_token,
-    db::{customer_repo, payment_repo, subscription_repo},
+    crypto::{generate_payment_token, generate_status_query_token},
+    db::{customer_repo, models::PaytrPaymentRecord, payment_repo, subscription_repo},
     db::subscription_repo::DueSubscription,
     email, email_templates,
+    handlers::callback,
+    models::callback::CallbackPayload,
     paytr_client,
+    pricing::{amount_to_kurus, format_tl, tl_to_kurus},
     AppState,
 };
 
-/// Callback'i gelmemiş pending ödemeler bu kadar saat sonra `failed (no_callback)` olur.
+/// Callback'i gelmemiş pending ödemeler bu kadar saat sonra PayTR'a sorulur.
 const STALE_PENDING_HOURS: i32 = 48;
+/// Durumu bu kadar gün öğrenilemeyen ödeme elle incelemeye alınır.
+const STATUS_UNKNOWN_REVIEW_DAYS: i64 = 7;
+/// Bir çalışmada sorulan en fazla ödeme.
+const STALE_BATCH: i64 = 50;
 
-/// Scheduler'ı arka planda başlatır. Servis ayakta olduğu sürece döngü çalışır.
+/// Scheduler'ı arka planda başlatır. Her çalışma ayrı bir görevde yürür: bir panic yalnızca o
+/// çalışmayı düşürür, döngü sürer (eskiden görev sessizce ölüyor, yenilemeler duruyordu).
+/// Son başarılı çalışma zamanı `/health`'te görünür.
 pub fn start(state: AppState) {
     let interval = Duration::from_secs(state.config.scheduler_interval_secs);
 
@@ -35,22 +44,142 @@ pub fn start(state: AppState) {
             ticker.tick().await;
             tracing::info!("Subscription scheduler çalışıyor");
 
-            if let Err(e) = process_due(&state).await {
-                tracing::error!("Scheduler genel hatası: {:?}", e);
+            let run_state = state.clone();
+            match tokio::spawn(async move { process_due(&run_state).await }).await {
+                Ok(Ok(())) => state
+                    .scheduler_last_ok
+                    .store(Utc::now().timestamp(), std::sync::atomic::Ordering::Relaxed),
+                Ok(Err(e)) => tracing::error!("Scheduler genel hatası: {:?}", e),
+                Err(e) => tracing::error!("Scheduler çalışması panic ile düştü, sonraki çalışmada devam: {:?}", e),
             }
         }
     });
+}
+
+/// PayTR durum sorgusu sonucu.
+enum PaytrStatus {
+    /// Başarılı ödeme var; müşterinin ödediği (kuruş) ve iade yapılmış mı.
+    Paid { total_kurus: i64, refunded: bool },
+    /// `004`: bu sipariş numarasıyla başarılı ödeme yok.
+    NotPaid,
+}
+
+async fn query_payment_status(state: &AppState, merchant_oid: &str) -> anyhow::Result<PaytrStatus> {
+    let token = generate_status_query_token(
+        &state.config.merchant_id,
+        merchant_oid,
+        &state.config.merchant_salt,
+        &state.config.merchant_key,
+    );
+    let v: serde_json::Value = state
+        .http
+        .post(paytr_client::status_query_endpoint())
+        .form(&[
+            ("merchant_id", state.config.merchant_id.as_str()),
+            ("merchant_oid", merchant_oid),
+            ("paytr_token", token.as_str()),
+        ])
+        .send()
+        .await?
+        .json()
+        .await?;
+    let text = |k: &str| match &v[k] {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+    match v["status"].as_str() {
+        Some("success") => {
+            let total = text("payment_total")
+                .and_then(|t| tl_to_kurus(&t))
+                .ok_or_else(|| anyhow::anyhow!("payment_total okunamadı: {}", v))?;
+            let refunded = v["returns"].as_array().is_some_and(|r| !r.is_empty());
+            Ok(PaytrStatus::Paid { total_kurus: total, refunded })
+        }
+        Some("error") if text("err_no").as_deref() == Some("004") => Ok(PaytrStatus::NotPaid),
+        _ => Err(anyhow::anyhow!("durum sorgusu yanıtı: {}", v)),
+    }
+}
+
+/// Callback'i gelmemiş eski pending ödemeler: körlemesine `failed` yapmak yerine PayTR'a sorulur.
+/// - Başarılıysa callback ile aynı yoldan işlenir (tutar ve abonelik kontrolleri dahil); iade
+///   edilmişse incelemeye alınır.
+/// - `004` (başarılı ödeme yok) → `failed`; abonelik sonraki denemede yeniden çekilebilir.
+/// - Durum öğrenilemezse pending kalır (yenileme de beklemede kalır); 7 günü aşarsa incelemeye alınır.
+async fn resolve_stale_pending(state: &AppState) {
+    let list = match payment_repo::list_stale_pending(&state.db, STALE_PENDING_HOURS, STALE_BATCH).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("Eski pending ödemeler okunamadı: {:?}", e);
+            return;
+        }
+    };
+    for p in list {
+        let oid = p.merchant_oid.as_str();
+        match query_payment_status(state, oid).await {
+            Ok(PaytrStatus::Paid { total_kurus, refunded: false }) => {
+                tracing::warn!(merchant_oid = oid, "Callback'i gelmemiş başarılı ödeme bulundu, işleniyor");
+                let payload = synthetic_payload(&p, total_kurus);
+                if let Err(e) = callback::handle_success(state, &payload).await {
+                    tracing::error!(merchant_oid = oid, "Callback'siz başarılı ödeme işlenemedi: {:?}", e);
+                }
+            }
+            Ok(PaytrStatus::Paid { total_kurus, refunded: true }) => {
+                review(state, &p, total_kurus, "paid_and_refunded_without_callback").await;
+            }
+            Ok(PaytrStatus::NotPaid) => {
+                if let Err(e) = payment_repo::set_failed(&state.db, oid, Some("004"), Some("no_callback")).await {
+                    tracing::error!(merchant_oid = oid, "Pending ödeme failed yapılamadı: {:?}", e);
+                } else {
+                    tracing::info!(merchant_oid = oid, "Callback'i gelmeyen ödeme PayTR'da başarısız, failed işaretlendi");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(merchant_oid = oid, "Ödeme durumu sorgulanamadı: {:?}", e);
+                let age = Utc::now().naive_utc() - p.created_at;
+                if age > chrono::Duration::days(STATUS_UNKNOWN_REVIEW_DAYS) {
+                    let expected = amount_to_kurus(&p.amount).unwrap_or(0);
+                    review(state, &p, expected, "status_unknown").await;
+                }
+            }
+        }
+    }
+}
+
+/// PayTR'ın doğruladığı başarılı ödemeyi callback ile aynı yoldan işlemek için yük.
+fn synthetic_payload(p: &PaytrPaymentRecord, total_kurus: i64) -> CallbackPayload {
+    CallbackPayload {
+        merchant_oid: p.merchant_oid.clone(),
+        status: "success".to_string(),
+        total_amount: total_kurus.to_string(),
+        hash: String::new(),
+        utoken: None,
+        failed_reason_code: None,
+        failed_reason_msg: None,
+        test_mode: None,
+        payment_type: None,
+        currency: None,
+        payment_amount: None,
+        installment_count: None,
+    }
+}
+
+async fn review(state: &AppState, p: &PaytrPaymentRecord, total_kurus: i64, reason: &str) {
+    match payment_repo::set_review(&state.db, &p.merchant_oid, reason).await {
+        Ok(true) => {
+            tracing::warn!(merchant_oid = %p.merchant_oid, amount = %format_tl(total_kurus), reason, "Ödeme incelemeye alındı");
+            callback::alert_review(state, reason, &synthetic_payload(p, total_kurus), p.member_id, p.subscription_id).await;
+        }
+        Ok(false) => {}
+        Err(e) => tracing::error!(merchant_oid = %p.merchant_oid, "Ödeme incelemeye alınamadı: {:?}", e),
+    }
 }
 
 /// Sıra önemli: önce vadesi gelenler tahsil edilir, sonra süresi dolanlar expire edilir.
 /// (Eskiden önce expire çalışıyordu; `next_payment_date == expires_at` olduğundan vadesi
 /// gelen abonelik tahsil edilmeden expired oluyor, otomatik yenileme hiç çalışmıyordu.)
 pub async fn process_due(state: &AppState) -> anyhow::Result<()> {
-    match payment_repo::fail_stale_pending(&state.db, STALE_PENDING_HOURS).await {
-        Ok(0) => {}
-        Ok(n) => tracing::warn!(count = n, "Callback'i gelmeyen eski pending ödemeler failed işaretlendi"),
-        Err(e) => tracing::error!("Eski pending ödemeler temizlenemedi: {:?}", e),
-    }
+    resolve_stale_pending(state).await;
 
     // CVV gerektiren ve vadesi gelen kartlara email gönder (otomatik çekilemiyor)
     notify_cvv_required(state).await;
@@ -64,10 +193,18 @@ pub async fn process_due(state: &AppState) -> anyhow::Result<()> {
     }
 
     for sub in &due {
-        // Deneme zamanı önce yazılır: PayTR'a ulaşılamasa bile aynı gün tekrar denenmez.
-        if let Err(e) = subscription_repo::mark_renewal_attempt(&state.db, sub.subscription_id).await {
-            tracing::error!(subscription_id = sub.subscription_id, "Deneme zamanı yazılamadı, atlandı: {:?}", e);
-            continue;
+        // Deneme önce sahiplenilir (koşullu): PayTR'a ulaşılamasa bile aynı gün tekrar denenmez,
+        // aynı anda çalışan ikinci bir süreç de aynı aboneliği çekemez.
+        match subscription_repo::claim_renewal_attempt(&state.db, sub.subscription_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(subscription_id = sub.subscription_id, "Yenileme başka bir süreçte, atlandı");
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(subscription_id = sub.subscription_id, "Deneme zamanı yazılamadı, atlandı: {:?}", e);
+                continue;
+            }
         }
 
         match charge(state, sub).await {
@@ -114,6 +251,8 @@ pub async fn process_due(state: &AppState) -> anyhow::Result<()> {
 
     // Süresi dolmuş abonelikleri 'expired' yap, kullanıcıları Standard'a düşür, kartları sil.
     expire_subscriptions(state).await?;
+    // Daha önce silinemeyen kartları yeniden dene.
+    cards::retry_orphan_cards(state).await;
 
     Ok(())
 }
@@ -212,6 +351,13 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Tutar normalize edilir: kayıtta "149.00" (TL) ya da eski biçimde kuruş olabilir; PayTR
+    // TL bekler (ham "14900" gönderilseydi 14.900 TL çekilmeye çalışılırdı).
+    let amount_kurus = amount_to_kurus(&sub.amount)
+        .filter(|k| *k > 0)
+        .ok_or_else(|| anyhow::anyhow!("Geçersiz abonelik tutarı: {}", sub.amount))?;
+    let amount = format_tl(amount_kurus);
+
     let phone = if sub.user_phone.is_empty() { "5305861333" } else { sub.user_phone.as_str() };
 
     let merchant_oid = renewal_merchant_oid(sub.subscription_id, Utc::now().timestamp_millis());
@@ -222,7 +368,7 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
         "127.0.0.1",
         &merchant_oid,
         &sub.user_email,
-        &sub.amount,
+        &amount,
         "card",
         "0",
         &sub.currency,
@@ -232,14 +378,15 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
         &state.config.merchant_key,
     );
 
-    // Pending ödeme kaydı oluştur
-    payment_repo::create(
+    // Pending ödeme kaydı oluştur. Abonelik başına tek pending (migration 0009): yarışta
+    // ikinci kayıt reddedilir ve PayTR'a istek gitmez.
+    if let Err(e) = payment_repo::create(
         &state.db,
         payment_repo::NewPayment {
             member_id: sub.member_id,
             subscription_id: Some(sub.subscription_id),
             merchant_oid: &merchant_oid,
-            amount: &sub.amount,
+            amount: &amount,
             currency: &sub.currency,
             payment_type: "card",
             installment_count: 0,
@@ -249,9 +396,16 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
             ctoken: Some(&sub.ctoken),
         },
     )
-    .await?;
+    .await
+    {
+        if payment_repo::is_unique_violation(&e) {
+            tracing::warn!(subscription_id = sub.subscription_id, "Beklemede ödeme mevcut (eşzamanlı), atlandı");
+            return Ok(());
+        }
+        return Err(e);
+    }
 
-    let basket = build_basket(&sub.plan, &sub.amount)?;
+    let basket = build_basket(&sub.plan, amount_kurus);
     let ok_url = format!("{}/api/v1/payments/ok", state.config.base_url);
     let fail_url = format!("{}/api/v1/payments/fail", state.config.base_url);
 
@@ -262,7 +416,7 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
         ("merchant_oid",      merchant_oid.as_str()),
         ("email",             sub.user_email.as_str()),
         ("payment_type",      "card"),
-        ("payment_amount",    sub.amount.as_str()),
+        ("payment_amount",    amount.as_str()),
         ("installment_count", "0"),
         ("currency",          sub.currency.as_str()),
         ("test_mode",         test_mode_str.as_str()),
@@ -339,24 +493,15 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
     }
 }
 
-/// PayTR sepet formatı: JSON.stringify([["Plan Adı", "Fiyat", 1]]). Tutar zaten TL ("149.00").
-fn build_basket(plan: &str, amount_tl: &str) -> anyhow::Result<String> {
+/// PayTR sepet formatı: JSON.stringify([["Plan Adı", "Fiyat", 1]]); fiyat TL ("149.00").
+fn build_basket(plan: &str, amount_kurus: i64) -> String {
     let label = match plan {
         "gold"       => "Gold Plan Aboneliği",
         "silver"     => "Silver Plan Aboneliği",
         "enterprise" => "Enterprise Plan Aboneliği",
         other        => other,
     };
-    let amount = amount_tl
-        .trim()
-        .parse::<f64>()
-        .map_err(|_| anyhow::anyhow!("Geçersiz tutar formatı: {}", amount_tl))?;
-    let price = format!("{:.2}", amount);
-    Ok(serde_json::to_string(&vec![[
-        serde_json::Value::String(label.to_string()),
-        serde_json::Value::String(price),
-        serde_json::Value::Number(1.into()),
-    ]])?)
+    serde_json::json!([[label, format_tl(amount_kurus), 1]]).to_string()
 }
 
 #[cfg(test)]
@@ -372,8 +517,7 @@ mod tests {
 
     #[test]
     fn basket_price_is_tl_amount() {
-        assert_eq!(build_basket("gold", "299.00").unwrap(), r#"[["Gold Plan Aboneliği","299.00",1]]"#);
-        assert_eq!(build_basket("enterprise", "101099.00").unwrap(), r#"[["Enterprise Plan Aboneliği","101099.00",1]]"#);
-        assert!(build_basket("gold", "abc").is_err());
+        assert_eq!(build_basket("gold", 29_900), r#"[["Gold Plan Aboneliği","299.00",1]]"#);
+        assert_eq!(build_basket("enterprise", 10_109_900), r#"[["Enterprise Plan Aboneliği","101099.00",1]]"#);
     }
 }

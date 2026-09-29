@@ -17,7 +17,7 @@ pub struct NewPayment<'a> {
     pub ctoken: Option<&'a str>,
 }
 
-pub async fn create(pool: &PgPool, p: NewPayment<'_>) -> Result<PaytrPaymentRecord> {
+pub async fn create<'e>(ex: impl PgExecutor<'e>, p: NewPayment<'_>) -> Result<PaytrPaymentRecord> {
     let rec = sqlx::query_as::<_, PaytrPaymentRecord>(
         r#"
         INSERT INTO paytr_payments
@@ -38,7 +38,7 @@ pub async fn create(pool: &PgPool, p: NewPayment<'_>) -> Result<PaytrPaymentReco
     .bind(p.test_mode)
     .bind(p.utoken)
     .bind(p.ctoken)
-    .fetch_one(pool)
+    .fetch_one(ex)
     .await?;
     Ok(rec)
 }
@@ -92,18 +92,27 @@ pub async fn set_success<'e>(ex: impl PgExecutor<'e>, merchant_oid: &str) -> Res
     Ok(())
 }
 
-/// Tutar tutarsızlığı gibi elle incelenmesi gereken ödemeler.
-pub async fn set_review(pool: &PgPool, merchant_oid: &str, reason: &str) -> Result<()> {
-    sqlx::query(
+/// Tahsil edilmiş ama otomatik işlenemeyen ödemeyi elle incelemeye alır (tutar tutarsızlığı,
+/// artık geçerli olmayan aboneliğe gelen ödeme vb.). Sync yanıtında `failed` işaretlenmiş
+/// ödemenin sonradan gelen başarılı callback'i de kapsanır. Dönüş: güncellendi mi.
+pub async fn set_review<'e>(ex: impl PgExecutor<'e>, merchant_oid: &str, reason: &str) -> Result<bool> {
+    let r = sqlx::query(
         "UPDATE paytr_payments
          SET status = 'review', failed_reason_msg = $1, callback_received_at = NOW()
-         WHERE merchant_oid = $2 AND status = 'pending'",
+         WHERE merchant_oid = $2 AND status IN ('pending', 'failed')",
     )
     .bind(reason)
     .bind(merchant_oid)
-    .execute(pool)
+    .execute(ex)
     .await?;
-    Ok(())
+    Ok(r.rows_affected() > 0)
+}
+
+/// Veritabanı tekil kısıt ihlali mi? (ör. abonelik başına tek pending ödeme indeksi)
+pub fn is_unique_violation(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<sqlx::Error>()
+        .and_then(|e| e.as_database_error())
+        .is_some_and(|d| d.code().as_deref() == Some("23505"))
 }
 
 /// Bekleyen ödemeyi başarısız işaretler. Yalnızca ilk bildirim etkili olur (PayTR aynı
@@ -132,16 +141,17 @@ pub async fn set_failed(
     Ok(rec)
 }
 
-/// Callback'i hiç gelmemiş eski bekleyen ödemeler: başarılı olsaydı PayTR callback'i
-/// (yeniden denemeleriyle) gelirdi. Aboneliğin yenilemesini sonsuza kilitlemesinler.
-pub async fn fail_stale_pending(pool: &PgPool, older_than_hours: i32) -> Result<u64> {
-    let r = sqlx::query(
-        "UPDATE paytr_payments
-         SET status = 'failed', failed_reason_msg = 'no_callback'
-         WHERE status = 'pending' AND created_at < NOW() - make_interval(hours => $1)",
+/// Callback'i gelmemiş eski bekleyen ödemeler (en eskiler önce). Scheduler her birinin
+/// durumunu PayTR'a sorar: callback kaybolmuş ama para çekilmişse yeniden çekim yapılmasın.
+pub async fn list_stale_pending(pool: &PgPool, older_than_hours: i32, limit: i64) -> Result<Vec<PaytrPaymentRecord>> {
+    let recs = sqlx::query_as::<_, PaytrPaymentRecord>(
+        "SELECT * FROM paytr_payments
+         WHERE status = 'pending' AND created_at < NOW() - make_interval(hours => $1)
+         ORDER BY created_at LIMIT $2",
     )
     .bind(older_than_hours)
-    .execute(pool)
+    .bind(limit)
+    .fetch_all(pool)
     .await?;
-    Ok(r.rows_affected())
+    Ok(recs)
 }

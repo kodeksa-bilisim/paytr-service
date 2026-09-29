@@ -68,6 +68,29 @@ pub struct CancelScheduleRequest {
     pub member_id: i32,
 }
 
+/// Yükseltme tutarı sorgusu (ödeme başlatmadan önce kullanıcıya gösterilir).
+#[derive(Debug, Deserialize)]
+pub struct UpgradeQuoteRequest {
+    pub member_id: i32,
+    /// "silver" | "gold" | "enterprise"
+    pub plan: String,
+    pub billing_cycle: String,
+    /// Yalnızca enterprise için.
+    pub users: Option<i32>,
+    pub extra_links: Option<i32>,
+    pub extra_clicks: Option<i32>,
+}
+
+/// Tutarlar TL ("724.50"). Geçerli abonelik yoksa kredi 0 ve `from_*` alanları boş.
+#[derive(Debug, Serialize)]
+pub struct UpgradeQuoteResponse {
+    pub list_amount: String,
+    pub credit_amount: String,
+    pub charge_amount: String,
+    pub from_plan: Option<String>,
+    pub from_expires_at: Option<String>,
+}
+
 /// Downgrade planlama yanıtı.
 #[derive(Debug, Serialize)]
 pub struct ScheduleDowngradeResponse {
@@ -93,6 +116,10 @@ pub struct InitPaymentResponse {
     pub payment_id: i32,
     pub subscription_id: i32,
     pub paytr_endpoint: String,
+    /// Planın dönem fiyatı (TL). Tahsil edilen tutar `form_params.payment_amount`'tır:
+    /// yükseltmede liste fiyatından `credit_amount` düşülmüş hâli.
+    pub list_amount: String,
+    pub credit_amount: String,
     pub form_params: PaytrFormParams,
 }
 

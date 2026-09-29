@@ -9,7 +9,7 @@ pub async fn upsert_user_token(pool: &PgPool, member_id: i32, utoken: &str) -> R
         r#"
         INSERT INTO paytr_user_tokens (member_id, utoken)
         VALUES ($1, $2)
-        ON CONFLICT (utoken) DO UPDATE SET updated_at = NOW()
+        ON CONFLICT (utoken) DO UPDATE SET updated_at = NOW(), is_active = TRUE
         RETURNING *
         "#,
     )
@@ -22,7 +22,8 @@ pub async fn upsert_user_token(pool: &PgPool, member_id: i32, utoken: &str) -> R
 
 pub async fn get_user_token(pool: &PgPool, member_id: i32) -> Result<Option<PaytrUserToken>> {
     let rec = sqlx::query_as::<_, PaytrUserToken>(
-        "SELECT * FROM paytr_user_tokens WHERE member_id = $1 AND is_active = TRUE LIMIT 1",
+        // Üyenin birden fazla utoken'ı olabilir (her yeni kartlı ödemede PayTR yenisini verir): en güncel.
+        "SELECT * FROM paytr_user_tokens WHERE member_id = $1 AND is_active = TRUE ORDER BY updated_at DESC, id DESC LIMIT 1",
     )
     .bind(member_id)
     .fetch_optional(pool)
@@ -105,7 +106,7 @@ pub async fn list_by_member(pool: &PgPool, member_id: i32) -> Result<Vec<PaytrCa
         r#"
         SELECT c.* FROM paytr_cards c
         JOIN paytr_user_tokens t ON t.utoken = c.utoken
-        WHERE t.member_id = $1 AND c.is_active = TRUE AND t.is_active = TRUE
+        WHERE t.member_id = $1 AND c.is_active = TRUE
         ORDER BY c.is_default DESC, c.created_at ASC
         "#,
     )
@@ -115,26 +116,53 @@ pub async fn list_by_member(pool: &PgPool, member_id: i32) -> Result<Vec<PaytrCa
     Ok(cards)
 }
 
-/// Abonelik iptali / KVKK silme: üyenin tüm aktif kartlarını ve utoken'ını
-/// deaktive eder. PayTR'a silme isteği atmadan önce çağrılmamalı; bu fonksiyon
-/// yalnızca DB tarafını temizler.
-pub async fn purge_member_cards(pool: &PgPool, member_id: i32) -> Result<()> {
+/// PayTR'dan silinen kartı DB'de pasifler.
+pub async fn deactivate_card(pool: &PgPool, ctoken: &str) -> Result<()> {
+    sqlx::query("UPDATE paytr_cards SET is_active = FALSE, is_default = FALSE WHERE ctoken = $1")
+        .bind(ctoken)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Aktif kartı kalmayan utoken'ları pasifler.
+pub async fn deactivate_empty_tokens(pool: &PgPool, member_id: i32) -> Result<()> {
     sqlx::query(
         r#"
-        UPDATE paytr_cards SET is_active = FALSE
-        WHERE utoken IN (SELECT utoken FROM paytr_user_tokens WHERE member_id = $1)
+        UPDATE paytr_user_tokens t SET is_active = FALSE, updated_at = NOW()
+        WHERE t.member_id = $1 AND t.is_active
+          AND NOT EXISTS (SELECT 1 FROM paytr_cards c WHERE c.utoken = t.utoken AND c.is_active)
         "#,
     )
     .bind(member_id)
     .execute(pool)
     .await?;
-
-    sqlx::query(
-        "UPDATE paytr_user_tokens SET is_active = FALSE WHERE member_id = $1",
-    )
-    .bind(member_id)
-    .execute(pool)
-    .await?;
-
     Ok(())
+}
+
+/// Geçerli aboneliği kalmadığı hâlde PayTR'da kartı duran üyeler (önceki silmesi başarısız
+/// olanlar ya da eski sürümün tek utoken ile silemedikleri). Son 1 günde kart eklenen veya
+/// bekleyen ödemesi/aboneliği olan üyeler atlanır (ödeme sürerken kart silinmesin).
+pub async fn members_with_orphan_cards(pool: &PgPool, limit: i64) -> Result<Vec<i32>> {
+    let ids = sqlx::query_scalar(
+        r#"
+        SELECT DISTINCT t.member_id FROM paytr_cards c
+        JOIN paytr_user_tokens t ON t.utoken = c.utoken
+        WHERE c.is_active
+          AND c.created_at < NOW() - INTERVAL '1 day'
+          AND NOT EXISTS (
+                SELECT 1 FROM paytr_subscriptions s
+                WHERE s.member_id = t.member_id
+                  AND (s.status IN ('active', 'pending') OR (s.status = 'cancelled' AND s.expires_at > NOW()))
+              )
+          AND NOT EXISTS (
+                SELECT 1 FROM paytr_payments p WHERE p.member_id = t.member_id AND p.status = 'pending'
+              )
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids)
 }

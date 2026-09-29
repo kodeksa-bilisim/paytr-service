@@ -35,6 +35,9 @@ pub struct Config {
     pub internal_api_token: String,
     /// Email ayarları — tüm SMTP değişkenleri tanımlıysa Some, değilse None.
     pub email: Option<EmailConfig>,
+    /// İnceleme gerektiren ödemeler (tutar uyuşmazlığı, geçersiz aboneliğe tahsilat) bu adrese
+    /// bildirilir (`ALERT_EMAIL`). Tanımlı değilse yalnızca loglanır.
+    pub alert_email: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -80,7 +83,7 @@ impl Config {
             merchant_id: std::env::var("MERCHANT_ID").context("MERCHANT_ID eksik")?,
             merchant_key: std::env::var("MERCHANT_KEY").context("MERCHANT_KEY eksik")?,
             merchant_salt: std::env::var("MERCHANT_SALT").context("MERCHANT_SALT eksik")?,
-            host: std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
+            host: std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
             port: std::env::var("PORT")
                 .unwrap_or_else(|_| "3001".to_string())
                 .parse()
@@ -110,6 +113,7 @@ impl Config {
                 t
             },
             email: build_email_config(),
+            alert_email: std::env::var("ALERT_EMAIL").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         })
     }
 }

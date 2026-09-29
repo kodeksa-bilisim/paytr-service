@@ -482,6 +482,30 @@ pub fn subscription_cancelled(
     })
 }
 
+/// Yöneticiye: elle incelenmesi gereken ödeme (tahsil edilmiş olabilir; iade gerekebilir).
+pub fn payment_review_alert(reason: &str, details: Vec<(&str, String)>, site_url: &str) -> EmailContent {
+    let subject = format!("[nlink ödeme] İnceleme gerekiyor: {reason}");
+    render(&Layout {
+        subject: &subject,
+        preheader: "Bir ödeme otomatik işlenmedi ve incelemeye alındı.",
+        eyebrow: "Yönetici Uyarısı",
+        heading: "Ödeme incelemeye alındı",
+        greeting: "Merhaba,".to_string(),
+        paragraphs: vec![
+            format!(
+                "Aşağıdaki ödeme PayTR'dan başarılı bildirildi ancak otomatik işlenmedi (neden: <strong>{}</strong>). \
+                 Abonelik ve müşteri kaydı değiştirilmedi; tahsilat gerekiyorsa iade edilmelidir.",
+                esc(reason)
+            ),
+        ],
+        features: vec![],
+        details,
+        cta: None,
+        note: Some("Ödeme kaydının durumu <code>review</code> olarak işaretlendi.".to_string()),
+        site_url,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

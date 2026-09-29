@@ -89,6 +89,14 @@ pub fn generate_card_delete_token(
     hmac_sha256_base64(&data, merchant_key)
 }
 
+/// Ödeme durum sorgusu token'ı.
+///
+/// Formül: HMAC-SHA256(merchant_id + merchant_oid + merchant_salt, merchant_key) → base64
+pub fn generate_status_query_token(merchant_id: &str, merchant_oid: &str, merchant_salt: &str, merchant_key: &str) -> String {
+    let data = format!("{}{}{}", merchant_id, merchant_oid, merchant_salt);
+    hmac_sha256_base64(&data, merchant_key)
+}
+
 /// Uzunluk dışında sabit zamanlı bayt karşılaştırması (iç API token'ı için).
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {

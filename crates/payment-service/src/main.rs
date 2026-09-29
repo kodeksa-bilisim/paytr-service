@@ -8,6 +8,7 @@ mod error;
 mod handlers;
 mod models;
 mod paytr_client;
+mod pricing;
 mod scheduler;
 
 use std::sync::Arc;
@@ -33,6 +34,8 @@ pub struct AppData {
     pub http: reqwest::Client,
     pub db: Db,
     pub mailer: Option<email::Mailer>,
+    /// Scheduler'ın son başarılı çalışması (unix saniye; 0 = henüz yok).
+    pub scheduler_last_ok: std::sync::atomic::AtomicI64,
 }
 
 pub type AppState = Arc<AppData>;
@@ -97,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
         http,
         db,
         mailer,
+        scheduler_last_ok: std::sync::atomic::AtomicI64::new(0),
     });
 
     // Subscription scheduler'ı arka planda başlat
@@ -110,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/subscriptions/reactivate", post(handlers::subscription::reactivate_subscription))
         .route("/api/v1/subscriptions/schedule-downgrade", post(handlers::payment::schedule_downgrade))
         .route("/api/v1/subscriptions/cancel-schedule", post(handlers::payment::cancel_scheduled_downgrade))
+        .route("/api/v1/subscriptions/upgrade-quote", post(handlers::payment::upgrade_quote))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&state), require_internal_token));
 
     let app = Router::new()
