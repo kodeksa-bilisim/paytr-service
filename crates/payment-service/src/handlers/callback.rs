@@ -72,10 +72,15 @@ fn first_payment_conflicts(sub: &PaytrSubscription, others: &[PaytrSubscription]
 /// savepoint geri alınır ve ödeme yine işlenir (fatura hatası abonelik aktivasyonunu
 /// engellemesin). Atlanan kayıt loglanır ve panelde "faturası olmayan ödeme" olarak görünür.
 async fn record_invoice(
+    state: &crate::AppData,
     tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
     payment: &PaytrPaymentRecord,
     subject: billing::InvoiceSubject<'_>,
 ) {
+    if state.config.is_invoice_exempt(payment.member_id) {
+        tracing::info!(merchant_oid = %payment.merchant_oid, member_id = payment.member_id, "Şirket içi hesap: fatura kaydı açılmadı");
+        return;
+    }
     let Some(total) = amount_to_kurus(&payment.amount).filter(|k| *k > 0) else {
         tracing::error!(merchant_oid = %payment.merchant_oid, amount = %payment.amount, "Fatura kaydı atlandı: tutar okunamadı");
         return;
@@ -219,7 +224,7 @@ pub(crate) async fn handle_success(state: &crate::AppData, payload: &CallbackPay
     }
 
     let Some(subscription_id) = payment.subscription_id else {
-        record_invoice(&mut tx, &payment, billing::InvoiceSubject::Other).await;
+        record_invoice(state, &mut tx, &payment, billing::InvoiceSubject::Other).await;
         payment_repo::set_success(&mut *tx, &payload.merchant_oid)
             .await
             .map_err(anyhow::Error::from)?;
@@ -375,7 +380,7 @@ pub(crate) async fn handle_success(state: &crate::AppData, payload: &CallbackPay
             end: expires_at,
         }
     };
-    record_invoice(&mut tx, &payment, subject).await;
+    record_invoice(state, &mut tx, &payment, subject).await;
 
     payment_repo::set_success(&mut *tx, &payload.merchant_oid)
         .await

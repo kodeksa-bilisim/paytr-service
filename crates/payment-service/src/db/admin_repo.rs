@@ -43,13 +43,15 @@ const PAYMENT_SELECT: &str = r#"
 
 /// Faturalamanın başladığı andan (ilk fatura kaydı) sonra başarılı olup fatura kaydı olmayan
 /// ödemeler. Normalde 0; callback'te fatura kaydı atlandıysa (bkz. `record_invoice`) artar.
-pub async fn payments_without_invoice(pool: &PgPool) -> Result<i64> {
+pub async fn payments_without_invoice(pool: &PgPool, exempt_members: &[i32]) -> Result<i64> {
     let n: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM paytr_payments p
          WHERE p.status = 'success' AND NOT p.test_mode
+           AND NOT (p.member_id = ANY($1))
            AND p.created_at >= (SELECT min(created_at) FROM invoices)
            AND NOT EXISTS (SELECT 1 FROM invoices i WHERE i.merchant_oid = p.merchant_oid AND i.kind = 'sale')",
     )
+    .bind(exempt_members)
     .fetch_one(pool)
     .await?;
     Ok(n)
@@ -123,6 +125,7 @@ pub async fn attention_payments(pool: &PgPool) -> Result<Vec<PaymentRow>> {
 /// Son N gündeki ödemelerin durum ve ret sebebi (özet sayıları Rust tarafında sınıflanır).
 #[derive(Debug, sqlx::FromRow)]
 pub struct StatusRow {
+    pub member_id: i32,
     pub status: String,
     pub is_3d: bool,
     pub failed_reason_msg: Option<String>,
@@ -133,7 +136,7 @@ pub struct StatusRow {
 
 pub async fn recent_statuses(pool: &PgPool, days: i32) -> Result<Vec<StatusRow>> {
     Ok(sqlx::query_as::<_, StatusRow>(
-        "SELECT status, is_3d, failed_reason_msg, amount, test_mode, created_at
+        "SELECT member_id, status, is_3d, failed_reason_msg, amount, test_mode, created_at
          FROM paytr_payments
          WHERE created_at > NOW() - make_interval(days => $1)",
     )

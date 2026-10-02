@@ -45,6 +45,21 @@ pub struct Config {
     /// ayrıca tanımlanması gereken bir yetkidir; yoksa her istek "magazanin yetkisi yok
     /// (sync_mode)" ile reddedilir. Kapalıyken (varsayılan) sonuç yalnızca callback ile gelir.
     pub sync_mode: bool,
+    /// Faturalanmayan şirket içi hesaplar (`INVOICE_EXEMPT_MEMBERS`, virgülle üye no'ları):
+    /// şirket kartıyla kendi hizmetine ödeyen hesaplar satış değildir. Ödemelerine fatura kaydı
+    /// açılmaz, paneldeki tahsilata ve "faturası olmayan ödeme" uyarısına girmez.
+    pub invoice_exempt_members: Vec<i32>,
+}
+
+/// "1, 7,x" → [1, 7]; geçersiz parçalar yok sayılır.
+fn parse_member_ids(raw: &str) -> Vec<i32> {
+    raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+}
+
+impl Config {
+    pub fn is_invoice_exempt(&self, member_id: i32) -> bool {
+        self.invoice_exempt_members.contains(&member_id)
+    }
 }
 
 impl std::fmt::Debug for Config {
@@ -60,6 +75,7 @@ impl std::fmt::Debug for Config {
             .field("base_url", &self.base_url)
             .field("grace_days", &self.grace_days)
             .field("sync_mode", &self.sync_mode)
+            .field("invoice_exempt_members", &self.invoice_exempt_members)
             .field("internal_api_token", &"[REDACTED]")
             .finish()
     }
@@ -128,6 +144,18 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "5305861333".to_string()),
             sync_mode: std::env::var("PAYTR_SYNC_MODE").is_ok_and(|v| v.trim() == "1"),
+            invoice_exempt_members: parse_member_ids(&std::env::var("INVOICE_EXEMPT_MEMBERS").unwrap_or_default()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_member_ids;
+
+    #[test]
+    fn member_id_list() {
+        assert_eq!(parse_member_ids("1, 7,x,,42 "), vec![1, 7, 42]);
+        assert!(parse_member_ids("").is_empty());
     }
 }

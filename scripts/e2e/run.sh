@@ -67,7 +67,7 @@ sql "INSERT INTO customers (member_id,name,email,user_type,subscription_status,s
  (5,'E','e@x.test','Gold','active','501'), (6,'F','f@x.test','Gold','active','601'),
  (7,'G','g@x.test','Standard',NULL,NULL), (8,'H','h@x.test','Gold','active','801'),
  (9,'I','i@x.test','Silver','active','901'), (10,'J','merchant-j@x.test','Gold','active','102'),
- (11,'K','async-k@x.test','Gold','active','103');"
+ (11,'K','async-k@x.test','Gold','active','103'), (12,'L','l@x.test','Gold','active','105');"
 
 python3 "$HERE/mock_paytr.py" $MOCK_PORT "$MOCK_LOG" & MOCK_PID=$!
 ( cd "$WORK" && env -i PATH="$PATH" \
@@ -75,6 +75,7 @@ python3 "$HERE/mock_paytr.py" $MOCK_PORT "$MOCK_LOG" & MOCK_PID=$!
     MERCHANT_ID=m1 MERCHANT_KEY=$KEY MERCHANT_SALT=$SALT HOST=127.0.0.1 PORT=$SVC_PORT TEST_MODE=0 \
     BASE_URL=$BASE SCHEDULER_INTERVAL_SECS=3 SCHEDULER_START_DELAY_SECS=1 GRACE_DAYS=4 \
     MAX_FAILED_ATTEMPTS=3 INTERNAL_API_TOKEN=$TOKEN PAYTR_BASE_URL=http://127.0.0.1:$MOCK_PORT \
+    INVOICE_EXEMPT_MEMBERS=12 \
     RUST_LOG=payment_service=debug "$ROOT/target/debug/payment-service" > "$SVC_LOG" 2>&1 ) & SVC_PID=$!
 for _ in $(seq 1 30); do curl -s "$BASE/health" >/dev/null && break; sleep 1; done
 
@@ -92,6 +93,7 @@ seed_sub 101 1 gold 299.00 ut1 "$UTC - interval '1 hour'"
 seed_sub 201 2 gold 299.00 ut2 "$UTC - interval '1 hour'"
 seed_sub 102 10 gold 299.00 ut10 "$UTC - interval '1 hour'"
 seed_sub 103 11 gold 299.00 ut11 "$UTC - interval '1 hour'"
+seed_sub 105 12 gold 299.00 ut12 "$UTC - interval '1 hour'"   # şirket içi hesap (faturalanmaz)
 seed_sub 301 3 silver 149.00 ut3 "$UTC + interval '10 days'"
 seed_sub 401 4 gold 299.00 ut4 "$UTC + interval '10 days'"
 seed_sub 501 5 gold 299.00 ut5 "$UTC + interval '10 days'"
@@ -187,6 +189,9 @@ eq "fatura kaydı: tek, bekliyor, KDV dahil %20 ayrımı" "$(sql "SELECT count(*
 eq "fatura: bireysel alıcı (ad + e-posta)" "$(sql "SELECT (buyer->>'type')||'/'||(buyer->>'name')||'/'||(buyer->>'email') FROM invoices WHERE merchant_oid='$P101'")" "individual/A/a@x.test"
 eq "fatura satırı: yenileme dönemi" "$(sql "SELECT (lines->0->>'name') LIKE 'nlink Gold plan aboneliği (aylık) — %.%.% – %.%.%' FROM invoices WHERE merchant_oid='$P101'")" t
 eq "PayTR sorgusuyla işlenen ödemeye de fatura" "$(sql "SELECT count(*) FROM invoices WHERE merchant_oid='paid4x'")" 1
+P105=$(sql "SELECT merchant_oid FROM paytr_payments WHERE subscription_id=105 ORDER BY id DESC LIMIT 1")
+callback "$P105" success 29900 >/dev/null
+eq "şirket içi hesap: yenileme işlendi, fatura kaydı yok" "$(sql "SELECT p.status||'/'||(SELECT count(*) FROM invoices WHERE merchant_oid='$P105') FROM paytr_payments p WHERE p.merchant_oid='$P105'")" "success/0"
 # Eşzamanlı çift callback: yeni bir yenileme ödemesi üret
 sql "UPDATE paytr_subscriptions SET next_payment_date=$UTC - interval '1 minute', last_renewal_attempt_at=NULL WHERE id=101"
 tick
@@ -314,9 +319,11 @@ sql "INSERT INTO paytr_payments(member_id,subscription_id,merchant_oid,amount,st
      (1,101,'r101t3000','abc',   'success',false,false,$UTC - interval '39 days',$UTC - interval '39 days');"
 eq "backfill token'sız → 401" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/admin/invoices/backfill")" 401
 eq "deneme modu (varsayılan) → 200" "$(post /api/v1/admin/invoices/backfill '' $TOKEN)" 200
-eq "deneme: 2 aday (test ödemesi hariç), hiçbir şey yazılmadı" "$(pyj "f\"{d['dry_run']}/{d['candidates']}/{d['created']}/{d['skipped']}\"")/$(sql "SELECT count(*) FROM invoices WHERE merchant_oid IN ('r101t1000','r101t3000','u1t2000')")" "True/2/0/1/0"
+eq "deneme: 3 aday (test ödemesi hariç), hiçbir şey yazılmadı" "$(pyj "f\"{d['dry_run']}/{d['candidates']}/{d['created']}/{d['skipped']}\"")/$(sql "SELECT count(*) FROM invoices WHERE merchant_oid IN ('r101t1000','r101t3000','u1t2000')")" "True/3/0/2/0"
+eq "şirket içi hesap atlanıyor" "$(pyj "next(i['reason'] for i in d['items'] if i['merchant_oid']=='$P105')")" "şirket içi hesap"
 eq "gerçek çalıştırma → 200" "$(post '/api/v1/admin/invoices/backfill?dry_run=false' '' $TOKEN)" 200
-eq "1 oluşturuldu, okunamayan tutar atlandı" "$(pyj "f\"{d['created']}/{d['skipped']}/\" + ','.join(i['action'] for i in d['items'])")" "1/1/created,skipped"
+eq "1 oluşturuldu; okunamayan tutar ve şirket içi hesap atlandı" "$(pyj "f\"{d['created']}/{d['skipped']}/\" + ','.join(i['action'] for i in d['items'])")" "1/2/created,skipped,skipped"
+eq "şirket içi hesaba geriye dönük kayıt da açılmadı" "$(sql "SELECT count(*) FROM invoices WHERE merchant_oid='$P105'")" 0
 eq "kayıt ödeme anına tarihli, işaretli, açıklamalı" "$(sql "SELECT provider||'/'||status||'/'||(created_at = (SELECT callback_received_at FROM paytr_payments WHERE merchant_oid='r101t1000'))||'/'||(lines->0->>'name')||'/'||total_kurus FROM invoices WHERE merchant_oid='r101t1000'")" "backfill/pending/true/nlink Gold plan aboneliği (aylık) — yenileme/29900"
 eq "test ödemesine fatura kaydı yok" "$(sql "SELECT count(*) FROM invoices WHERE merchant_oid='u1t2000'")" 0
 post '/api/v1/admin/invoices/backfill?dry_run=false' '' $TOKEN >/dev/null

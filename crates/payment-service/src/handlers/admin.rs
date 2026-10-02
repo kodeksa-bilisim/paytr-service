@@ -271,7 +271,7 @@ pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResp
         admin_repo::last_renewal_success(&state.db),
         admin_repo::problem_subscriptions(&state.db),
         admin_repo::attention_payments(&state.db),
-        admin_repo::payments_without_invoice(&state.db),
+        admin_repo::payments_without_invoice(&state.db, &state.config.invoice_exempt_members),
     )?;
 
     let week_ago = Utc::now().naive_utc() - Duration::days(7);
@@ -280,7 +280,8 @@ pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResp
         ["bank", "merchant", "abandoned", "system"].iter().map(|s| (*s, 0)).collect();
     let mut revenue_30d_kurus = 0;
     for r in &statuses_30d {
-        if r.status == "success" && !r.test_mode {
+        // Tahsilat: test ve şirket içi hesap ödemeleri satış değildir.
+        if r.status == "success" && !r.test_mode && !state.config.is_invoice_exempt(r.member_id) {
             revenue_30d_kurus += amount_to_kurus(&r.amount).unwrap_or(0);
         }
         if r.created_at < week_ago {
@@ -485,6 +486,13 @@ pub async fn backfill_invoices(
             action: "create",
             reason: None,
         };
+        if state.config.is_invoice_exempt(p.member_id) {
+            item.action = "skipped";
+            item.reason = Some("şirket içi hesap");
+            skipped += 1;
+            items.push(item);
+            continue;
+        }
         let Some(total) = total else {
             item.action = "skipped";
             item.reason = Some("tutar okunamadı");
