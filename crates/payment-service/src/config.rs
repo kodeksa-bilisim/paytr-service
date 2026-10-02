@@ -41,6 +41,10 @@ pub struct Config {
     /// PayTR `user_phone` zorunlu; müşterinin telefonu yoksa gönderilecek şirket iletişim
     /// numarası (`PAYTR_FALLBACK_PHONE`, varsayılan: sitede yayımlanan WhatsApp hattı).
     pub fallback_phone: String,
+    /// Yenilemelerde PayTR `sync_mode=1` (sonuç anında JSON döner). Mağazaya PayTR tarafından
+    /// ayrıca tanımlanması gereken bir yetkidir; yoksa her istek "magazanin yetkisi yok
+    /// (sync_mode)" ile reddedilir. Kapalıyken (varsayılan) sonuç yalnızca callback ile gelir.
+    pub sync_mode: bool,
 }
 
 impl std::fmt::Debug for Config {
@@ -55,6 +59,7 @@ impl std::fmt::Debug for Config {
             .field("database_url", &"[REDACTED]")
             .field("base_url", &self.base_url)
             .field("grace_days", &self.grace_days)
+            .field("sync_mode", &self.sync_mode)
             .field("internal_api_token", &"[REDACTED]")
             .finish()
     }
@@ -122,6 +127,7 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "5305861333".to_string()),
+            sync_mode: std::env::var("PAYTR_SYNC_MODE").is_ok_and(|v| v.trim() == "1"),
         })
     }
 }

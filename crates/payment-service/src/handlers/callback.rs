@@ -384,6 +384,33 @@ async fn handle_failed(state: &crate::AppData, payload: &CallbackPayload) -> Res
         return Ok(());
     }
 
+    // Mağaza tarafı ret (PayTR yetkisi, token, hash): müşterinin kartıyla ilgisiz. Deneme
+    // sayılmaz, müşteriye bildirim gitmez, yönetici uyarılır; scheduler ertesi gün yeniden dener.
+    if let Some(reason) = payload
+        .failed_reason_msg
+        .as_deref()
+        .filter(|m| paytr_client::is_merchant_side_error(m))
+    {
+        tracing::error!(
+            merchant_oid = %payload.merchant_oid, member_id = p.member_id, reason,
+            "Yenileme mağaza kaynaklı hatayla reddedildi (deneme sayılmadı)"
+        );
+        if let (Some(mailer), Some(email_cfg), Some(to)) = (&state.mailer, &state.config.email, &state.config.alert_email) {
+            let content = email_templates::renewal_blocked_alert(
+                reason,
+                vec![
+                    ("Sipariş no", payload.merchant_oid.clone()),
+                    ("Üye", p.member_id.to_string()),
+                    ("Abonelik", p.subscription_id.map_or("-".to_string(), |s| s.to_string())),
+                    ("Tutar", email_templates::format_tl(&p.amount)),
+                ],
+                &email_cfg.site_url,
+            );
+            email::send(mailer, email_cfg, to, content).await;
+        }
+        return Ok(());
+    }
+
     customer_repo::increment_failed_attempts(&state.db, p.member_id)
         .await
         .map_err(anyhow::Error::from)?;

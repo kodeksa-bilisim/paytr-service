@@ -215,11 +215,33 @@ pub async fn process_due(state: &AppState) -> anyhow::Result<()> {
                     "Yenileme isteği PayTR'a iletildi"
                 );
             }
-            Err(e) => {
+            // Mağaza tarafı (PayTR yetkisi/yapılandırma) ya da iç hata: müşterinin kartıyla ilgisiz.
+            // Deneme hakkından düşülmez, müşteriye "ödemeniz alınamadı" gitmez, yönetici uyarılır;
+            // ertesi gün yeniden denenir. (Eskiden bunlar da "banka onaylamadı" diye müşteriye
+            // gidiyor, haklar tükenince abonelik düşüyordu.)
+            Err(ChargeError::Merchant(reason)) => {
                 tracing::error!(
                     subscription_id = sub.subscription_id,
                     member_id = sub.member_id,
-                    "Yenileme hatası: {:?}", e
+                    reason = %reason,
+                    "Yenileme mağaza kaynaklı hatayla yapılamadı (deneme sayılmadı)"
+                );
+                alert_renewal_blocked(state, sub, &reason).await;
+            }
+            Err(ChargeError::Internal(e)) => {
+                tracing::error!(
+                    subscription_id = sub.subscription_id,
+                    member_id = sub.member_id,
+                    "Yenileme iç hatası (deneme sayılmadı): {:?}", e
+                );
+                alert_renewal_blocked(state, sub, &format!("iç hata: {e}")).await;
+            }
+            Err(ChargeError::Declined(reason)) => {
+                tracing::warn!(
+                    subscription_id = sub.subscription_id,
+                    member_id = sub.member_id,
+                    reason = ?reason,
+                    "Yenileme reddedildi"
                 );
                 let _ = subscription_repo::increment_renewal_attempts(&state.db, sub.subscription_id).await;
                 let _ = customer_repo::increment_failed_attempts(&state.db, sub.member_id).await;
@@ -231,14 +253,14 @@ pub async fn process_due(state: &AppState) -> anyhow::Result<()> {
                             Ok(Some(s)) => (state.config.max_failed_attempts - s.renewal_attempts).max(0),
                             _ => 0,
                         };
-                        // Kullanıcıya iç hata ayrıntısı gönderilmez.
+                        // Bankanın/PayTR'ın ret sebebi gösterilir (iç hatalar buraya gelmez).
                         let name = customer_repo::find_name(&state.db, sub.member_id).await;
                         let content = email_templates::payment_failed(
                             name.as_deref(),
                             &sub.plan,
                             &sub.billing_cycle,
                             &sub.amount,
-                            None,
+                            reason.as_deref(),
                             remaining,
                             &email_cfg.site_url,
                         );
@@ -341,7 +363,50 @@ fn renewal_merchant_oid(subscription_id: i32, now_ms: i64) -> String {
     format!("r{}t{}", subscription_id, now_ms)
 }
 
-async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
+/// Yenileme denemesinin başarısızlık türü; müşteriye ve deneme sayacına etkisi farklıdır.
+#[derive(Debug)]
+enum ChargeError {
+    /// Banka/PayTR kartı reddetti: deneme sayılır, müşteriye sebebiyle bildirilir.
+    Declined(Option<String>),
+    /// PayTR mağaza tarafını reddetti (yetki, token, hash): deneme sayılmaz, yönetici uyarılır.
+    Merchant(String),
+    /// Bizim tarafımızdaki hata (DB, geçersiz tutar): deneme sayılmaz, yönetici uyarılır.
+    Internal(anyhow::Error),
+}
+
+impl From<anyhow::Error> for ChargeError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Internal(e)
+    }
+}
+
+/// PayTR'ın JSON `failed` yanıtını sınıflandırır.
+fn classify_failure(reason: Option<&str>) -> ChargeError {
+    match reason {
+        Some(r) if paytr_client::is_merchant_side_error(r) => ChargeError::Merchant(r.to_string()),
+        r => ChargeError::Declined(r.map(str::to_string)),
+    }
+}
+
+/// Mağaza kaynaklı yenileme hatasını yöneticiye bildirir (e-posta yoksa yalnızca log).
+async fn alert_renewal_blocked(state: &AppState, sub: &DueSubscription, reason: &str) {
+    let (Some(mailer), Some(email_cfg), Some(to)) = (&state.mailer, &state.config.email, &state.config.alert_email) else {
+        return;
+    };
+    let content = email_templates::renewal_blocked_alert(
+        reason,
+        vec![
+            ("Abonelik", sub.subscription_id.to_string()),
+            ("Üye", sub.member_id.to_string()),
+            ("Plan", format!("{} ({})", sub.plan, sub.billing_cycle)),
+            ("Tutar", email_templates::format_tl(&sub.amount)),
+        ],
+        &email_cfg.site_url,
+    );
+    email::send(mailer, email_cfg, to, content).await;
+}
+
+async fn charge(state: &AppState, sub: &DueSubscription) -> Result<(), ChargeError> {
     // Çift ödeme koruması: aynı abonelik için zaten bekleyen ödeme varsa atla
     if payment_repo::has_pending(&state.db, sub.subscription_id).await? {
         tracing::warn!(
@@ -402,7 +467,7 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
             tracing::warn!(subscription_id = sub.subscription_id, "Beklemede ödeme mevcut (eşzamanlı), atlandı");
             return Ok(());
         }
-        return Err(e);
+        return Err(e.into());
     }
 
     let basket = build_basket(&sub.plan, amount_kurus);
@@ -431,21 +496,17 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
         ("merchant_ok_url",   ok_url.as_str()),
         ("merchant_fail_url", fail_url.as_str()),
         ("lang",              "tr"),
-        ("sync_mode",         "1"),
+        ("sync_mode",         if state.config.sync_mode { "1" } else { "0" }),
     ];
 
-    let resp: serde_json::Value = match async {
-        state
-            .http
-            .post(paytr_client::payment_endpoint())
-            .form(&form)
-            .send()
-            .await?
-            .json::<serde_json::Value>()
-            .await
+    let sent = async {
+        let r = state.http.post(paytr_client::payment_endpoint()).form(&form).send().await?;
+        let final_url = r.url().clone();
+        let body = r.text().await?;
+        Ok::<_, reqwest::Error>((final_url, body))
     }
-    .await
-    {
+    .await;
+    let (final_url, body) = match sent {
         Ok(v) => v,
         Err(e) => {
             // PayTR'a ulaşılamadı / yanıt okunamadı: ödeme durumu bilinmiyor. Başarısız
@@ -456,6 +517,30 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
                 merchant_oid = %merchant_oid,
                 "PayTR yanıtı alınamadı, ödeme pending bırakıldı: {}", e
             );
+            return Ok(());
+        }
+    };
+
+    // sync_mode=0: PayTR JSON döndürmez, ok/fail adresimize yönlendirir; kesin sonuç (ret
+    // sebebiyle) callback'e gelir ve `handle_failed`/`handle_success` işler. Ödeme pending kalır.
+    // PayTR isteği baştan reddederse yine JSON dönebilir; o durum aşağıda sync gibi işlenir.
+    let resp = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(v) if v.get("status").is_some() => v,
+        _ => {
+            if state.config.sync_mode {
+                tracing::error!(
+                    subscription_id = sub.subscription_id,
+                    merchant_oid = %merchant_oid,
+                    "PayTR sync yanıtı JSON değil, ödeme pending bırakıldı"
+                );
+            } else {
+                tracing::info!(
+                    subscription_id = sub.subscription_id,
+                    merchant_oid = %merchant_oid,
+                    redirected_to = %final_url.path(),
+                    "Yenileme PayTR'a iletildi, sonuç callback ile gelecek"
+                );
+            }
             return Ok(());
         }
     };
@@ -485,10 +570,7 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> anyhow::Result<()> {
             // Ödeme başarısız: DB'yi güncelle (callback gelmeyebilir; gelirse ikinci kez sayılmaz)
             payment_repo::set_failed(&state.db, &merchant_oid, None, reason).await?;
 
-            Err(anyhow::anyhow!(
-                "Ödeme reddedildi: {}",
-                reason.unwrap_or("bilinmeyen hata")
-            ))
+            Err(classify_failure(reason))
         }
     }
 }

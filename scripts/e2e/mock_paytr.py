@@ -27,7 +27,17 @@ class Handler(BaseHTTPRequestHandler):
             f.write(json.dumps({"path": self.path, "form": form}) + "\n")
 
         if self.path == "/odeme":
-            if "fail" in form.get("email", ""):
+            email = form.get("email", "")
+            # Gerçek PayTR: sync_mode=0'da JSON yok, ok/fail adresine yönlendirir; sonuç callback'le gelir.
+            if "async" in email and form.get("sync_mode") != "1":
+                self.send_response(302)
+                self.send_header("Location", form.get("merchant_ok_url", "/"))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if "merchant" in email:
+                body = {"status": "failed", "err_msg": "Bu islem icin magazanin yetkisi yok (sync_mode)"}
+            elif "fail" in email:
                 body = {"status": "failed", "err_msg": "Yetersiz bakiye"}
             else:
                 body = {"status": "success"}

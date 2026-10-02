@@ -482,6 +482,39 @@ pub fn subscription_cancelled(
     })
 }
 
+/// Yöneticiye: yenileme mağaza tarafındaki bir sorun (PayTR yetkisi, yapılandırma, iç hata)
+/// yüzünden yapılamadı. Müşteriye bildirim gitmedi, deneme hakkından düşülmedi; düzelene kadar
+/// her gün yeniden denenir.
+pub fn renewal_blocked_alert(reason: &str, details: Vec<(&str, String)>, site_url: &str) -> EmailContent {
+    let subject = format!("[nlink ödeme] Yenileme yapılamadı: {reason}");
+    render(&Layout {
+        subject: &subject,
+        preheader: "Bir abonelik yenilemesi mağaza tarafındaki bir sorun yüzünden yapılamadı.",
+        eyebrow: "Yönetici Uyarısı",
+        heading: "Yenileme mağaza kaynaklı bir hatayla durdu",
+        greeting: "Merhaba,".to_string(),
+        paragraphs: vec![
+            format!(
+                "Aşağıdaki abonelik yenilemesi müşterinin kartı yüzünden değil, mağaza tarafındaki bir \
+                 sorun yüzünden yapılamadı (neden: <strong>{}</strong>).",
+                esc(reason)
+            ),
+            "Müşteriye bildirim gönderilmedi ve deneme hakkından düşülmedi. Sorun giderilene kadar \
+             yenileme günde bir kez yeniden denenir; bu sürede bu uyarı tekrarlanır."
+                .to_string(),
+        ],
+        features: vec![],
+        details,
+        cta: None,
+        note: Some(
+            "PayTR yetkisi eksikse (ör. <code>sync_mode</code>) PayTR'dan açılmasını isteyin ya da \
+             ilgili ayarı kapatın."
+                .to_string(),
+        ),
+        site_url,
+    })
+}
+
 /// Yöneticiye: elle incelenmesi gereken ödeme (tahsil edilmiş olabilir; iade gerekebilir).
 pub fn payment_review_alert(reason: &str, details: Vec<(&str, String)>, site_url: &str) -> EmailContent {
     let subject = format!("[nlink ödeme] İnceleme gerekiyor: {reason}");

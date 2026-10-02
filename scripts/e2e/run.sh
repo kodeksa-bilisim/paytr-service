@@ -35,13 +35,13 @@ trap cleanup EXIT
 sql() { docker exec -i $PG psql -U postgres -X -q -A -t -v ON_ERROR_STOP=1 -c "$1"; }
 UTC="(now() at time zone 'utc')"   # psql oturumu Europe/Istanbul; servis UTC yazar
 
-callback() { # oid status total [utoken] → HTTP kodu
+callback() { # oid status total [utoken] [failed_reason_msg] → HTTP kodu
   local hash
   hash=$(printf '%s' "$1$SALT$2$3" | openssl dgst -sha256 -hmac "$KEY" -binary | base64)
   curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/payments/callback" \
     --data-urlencode "merchant_oid=$1" --data-urlencode "status=$2" \
     --data-urlencode "total_amount=$3" --data-urlencode "hash=$hash" \
-    ${4:+--data-urlencode "utoken=$4"}
+    ${4:+--data-urlencode "utoken=$4"} ${5:+--data-urlencode "failed_reason_msg=$5"}
 }
 post() { # path json [token] → HTTP kodu
   curl -s -o "$WORK/last.json" -w '%{http_code}' -X POST "$BASE$1" \
@@ -62,7 +62,8 @@ sql "INSERT INTO customers (member_id,name,email,user_type,subscription_status,s
  (3,'C','c@x.test','Silver','active','301'), (4,'D','d@x.test','Gold','active','401'),
  (5,'E','e@x.test','Gold','active','501'), (6,'F','f@x.test','Gold','active','601'),
  (7,'G','g@x.test','Standard',NULL,NULL), (8,'H','h@x.test','Gold','active','801'),
- (9,'I','i@x.test','Silver','active','901');"
+ (9,'I','i@x.test','Silver','active','901'), (10,'J','merchant-j@x.test','Gold','active','102'),
+ (11,'K','async-k@x.test','Gold','active','103');"
 
 python3 "$HERE/mock_paytr.py" $MOCK_PORT "$MOCK_LOG" & MOCK_PID=$!
 ( cd "$WORK" && env -i PATH="$PATH" \
@@ -85,6 +86,8 @@ seed_sub() {
 }
 seed_sub 101 1 gold 299.00 ut1 "$UTC - interval '1 hour'"
 seed_sub 201 2 gold 299.00 ut2 "$UTC - interval '1 hour'"
+seed_sub 102 10 gold 299.00 ut10 "$UTC - interval '1 hour'"
+seed_sub 103 11 gold 299.00 ut11 "$UTC - interval '1 hour'"
 seed_sub 301 3 silver 149.00 ut3 "$UTC + interval '10 days'"
 seed_sub 401 4 gold 299.00 ut4 "$UTC + interval '10 days'"
 seed_sub 501 5 gold 299.00 ut5 "$UTC + interval '10 days'"
@@ -128,6 +131,15 @@ eq "PayTR formu: lang=tr" "$(grep "\"merchant_oid\": \"$P101\"" "$MOCK_LOG" | gr
 eq "reddedilen yenileme: ödeme failed" "$(sql "SELECT status FROM paytr_payments WHERE subscription_id=201")" failed
 eq "reddedilen yenileme: 1 deneme sayıldı" "$(sql "SELECT renewal_attempts FROM paytr_subscriptions WHERE id=201")" 1
 eq "reddedilen yenileme: grace içinde hâlâ aktif" "$(sql "SELECT status FROM paytr_subscriptions WHERE id=201")" active
+eq "PayTR formu: sync_mode varsayılan 0" "$(grep "\"merchant_oid\": \"$P101\"" "$MOCK_LOG" | grep -c '"sync_mode": "0"')" 1
+eq "mağaza yetki hatası: ödeme failed" "$(sql "SELECT status FROM paytr_payments WHERE subscription_id=102")" failed
+eq "mağaza yetki hatası: deneme SAYILMADI" "$(sql "SELECT s.renewal_attempts||'/'||coalesce(c.failed_payment_attempts,0) FROM paytr_subscriptions s JOIN customers c ON c.member_id=s.member_id WHERE s.id=102")" "0/0"
+eq "mağaza yetki hatası: loglandı" "$(grep -c 'mağaza kaynaklı hatayla yapılamadı' "$SVC_LOG")" 1
+P103=$(sql "SELECT merchant_oid FROM paytr_payments WHERE subscription_id=103 ORDER BY id DESC LIMIT 1")
+eq "sync_mode=0 yönlendirmesi: ödeme pending (sonuç callback'le)" "$(sql "SELECT status FROM paytr_payments WHERE merchant_oid='$P103'")" pending
+eq "sync_mode=0 yönlendirmesi: deneme sayılmadı" "$(sql "SELECT renewal_attempts FROM paytr_subscriptions WHERE id=103")" 0
+eq "callback'te mağaza hatası → 200" "$(callback "$P103" failed 29900 "" "Bu islem icin magazanin yetkisi yok")" 200
+eq "callback'te mağaza hatası: failed, deneme SAYILMADI" "$(sql "SELECT p.status||'/'||s.renewal_attempts||'/'||coalesce(c.failed_payment_attempts,0) FROM paytr_payments p JOIN paytr_subscriptions s ON s.id=p.subscription_id JOIN customers c ON c.member_id=s.member_id WHERE p.merchant_oid='$P103'")" "failed/0/0"
 eq "saat dilimi: 2 saat sonra biten abonelik dokunulmadı" "$(sql "SELECT status||'/'||(SELECT count(*) FROM paytr_payments WHERE subscription_id=601 AND merchant_oid<>'old6') FROM paytr_subscriptions WHERE id=601")" "active/0"
 eq "callback'i gelmeyen, PayTR'da başarısız (004) → failed" "$(sql "SELECT status||':'||failed_reason_msg FROM paytr_payments WHERE merchant_oid='old6'")" "failed:no_callback"
 eq "callback'i gelmeyen ama PayTR'da başarılı → işlendi, 1 ay uzadı" "$(sql "SELECT p.status||'/'||(s.expires_at = timestamp '$OLD401' + interval '1 month') FROM paytr_payments p JOIN paytr_subscriptions s ON s.id=p.subscription_id WHERE p.merchant_oid='paid4x'")" "success/true"

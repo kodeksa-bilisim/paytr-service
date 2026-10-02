@@ -24,3 +24,31 @@ pub fn status_query_endpoint() -> String {
 pub fn card_delete_endpoint() -> String {
     format!("{}/odeme/capi/delete", base())
 }
+
+/// PayTR'ın ret mesajı mağaza tarafındaki bir sorunu mu anlatıyor (yetki, token, hash)?
+/// Bunlar müşterinin kartıyla ilgisizdir: deneme hakkından düşülmez, müşteriye "ödemeniz
+/// alınamadı" gönderilmez, yöneticiye bildirilir. Mesajlar ASCII Türkçe gelir
+/// ("Bu islem icin magazanin yetkisi yok (sync_mode)").
+pub fn is_merchant_side_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    // "yetkisi yok" tek başına yetmez: banka reddi de "kartin internet islem yetkisi yok" diyebilir.
+    ["magaza", "mağaza", "merchant", "paytr_token", "hash"]
+        .iter()
+        .any(|k| m.contains(k))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_merchant_side_errors() {
+        assert!(is_merchant_side_error("Bu islem icin magazanin yetkisi yok (sync_mode)"));
+        assert!(is_merchant_side_error("paytr_token gecersiz"));
+        assert!(is_merchant_side_error("Mağaza bulunamadı"));
+        assert!(!is_merchant_side_error("Yetersiz bakiye"));
+        assert!(!is_merchant_side_error("Kart limiti yetersiz"));
+        assert!(!is_merchant_side_error("Islem onaylanmadi"));
+        assert!(!is_merchant_side_error("Kartin internet islem yetkisi yok"));
+    }
+}
