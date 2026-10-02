@@ -1,3 +1,4 @@
+pub mod admin_repo;
 pub mod card_repo;
 pub mod customer_repo;
 pub mod models;

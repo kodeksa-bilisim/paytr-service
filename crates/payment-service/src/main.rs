@@ -115,6 +115,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/subscriptions/schedule-downgrade", post(handlers::payment::schedule_downgrade))
         .route("/api/v1/subscriptions/cancel-schedule", post(handlers::payment::cancel_scheduled_downgrade))
         .route("/api/v1/subscriptions/upgrade-quote", post(handlers::payment::upgrade_quote))
+        // Yönetici paneli (salt-okunur); admin yetkisi Next.js tarafında doğrulanır.
+        .route("/api/v1/admin/payments", get(handlers::admin::list_payments))
+        .route("/api/v1/admin/overview", get(handlers::admin::overview))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&state), require_internal_token));
 
     let app = Router::new()

@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod callback;
 pub mod payment;
 pub mod subscription;

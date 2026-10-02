@@ -47,6 +47,10 @@ post() { # path json [token] → HTTP kodu
   curl -s -o "$WORK/last.json" -w '%{http_code}' -X POST "$BASE$1" \
     -H 'Content-Type: application/json' ${3:+-H "X-Internal-Token: $3"} -d "$2"
 }
+get() { # path → HTTP kodu (iç token'la; gövde last.json'a)
+  curl -s -o "$WORK/last.json" -w '%{http_code}' -H "X-Internal-Token: $TOKEN" "$BASE$1"
+}
+pyj() { python3 -c "import json;d=json.load(open('$WORK/last.json'));print($1)"; }  # last.json üzerinde ifade
 tick() { sleep 5; }  # scheduler aralığı 3 sn
 
 echo "== Hazırlık"
@@ -148,6 +152,28 @@ eq "7 günü aşan bilinmeyen durum → review" "$(sql "SELECT status||':'||fail
 eq "health: scheduler son çalışması görünüyor" "$(curl -s $BASE/health | python3 -c "import json,sys;print(json.load(sys.stdin)['scheduler_last_ok_age_secs'] is not None)")" True
 tick
 eq "reddedilen yenileme aynı gün tekrar denenmedi" "$(sql "SELECT count(*) FROM paytr_payments WHERE subscription_id=201")" 1
+
+echo "== Yönetici paneli (salt-okunur uçlar)"
+eq "admin/payments token'sız → 401" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/v1/admin/payments")" 401
+eq "admin/overview token'sız → 401" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/v1/admin/overview")" 401
+eq "admin/payments geçersiz durum → 400" "$(get '/api/v1/admin/payments?status=drop')" 400
+eq "admin/payments geçersiz tür → 400" "$(get '/api/v1/admin/payments?kind=x')" 400
+eq "başarısız yenilemeler → 200" "$(get '/api/v1/admin/payments?status=failed&kind=renewal')" 200
+eq "başarısız yenilemeler: abonelik:sınıf" "$(pyj "','.join(sorted(f\"{i['subscription_id']}:{i['failure_class']}\" for i in d['items']))")" "102:merchant,103:merchant,201:bank"
+eq "tür filtresi yalnızca yenileme döndürür" "$(pyj "','.join(sorted({i['kind'] for i in d['items']}))")" renewal
+eq "tutar kuruş olarak" "$(pyj "d['items'][0]['amount_kurus']")" 29900
+get '/api/v1/admin/payments?q=merchant-j' >/dev/null
+eq "e-posta araması yalnızca o üyeyi bulur" "$(pyj "','.join(sorted({str(i['member_id']) for i in d['items']}))")" 10
+get '/api/v1/admin/payments?q=%25' >/dev/null
+eq "arama % karakterini joker saymaz" "$(pyj "len(d['items'])")" 0
+get '/api/v1/admin/payments?limit=1' >/dev/null
+eq "sayfalama: limit=1 → 1 kayıt + devamı var" "$(pyj "f\"{len(d['items'])}/{d['has_more']}\"")" "1/True"
+eq "admin/overview → 200" "$(get '/api/v1/admin/overview')" 200
+eq "7 gün başarısız dağılımı (abandoned/bank/merchant/system)" "$(pyj "'/'.join(str(v) for v in d['failed_7d_by_class'].values())")" "1/1/2/0"
+eq "sorunlu abonelik 201: ek sürede + başarısız deneme" "$(pyj "','.join(next(s['reasons'] for s in d['subscriptions'] if s['id']==201))")" "in_grace,failed_attempts"
+eq "sorunlu abonelik 201: son hata sınıfı banka" "$(pyj "next(s['last_failure_class'] for s in d['subscriptions'] if s['id']==201)")" bank
+eq "dikkat: incelemedeki + 48 saati geçen bekleyen ödeme" "$(pyj "','.join(sorted(p['merchant_oid'] for p in d['payments']))")" "unk5,unk9"
+eq "zamanlayıcı çalışıyor, sync_mode kapalı" "$(pyj "f\"{d['scheduler']['stalled']}/{d['scheduler']['sync_mode']}\"")" "False/False"
 
 echo "== Yenileme callback'i + çift callback"
 OLD_EXP=$(sql "SELECT expires_at FROM paytr_subscriptions WHERE id=101")
