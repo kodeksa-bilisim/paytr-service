@@ -24,17 +24,36 @@ pub struct PaymentRow {
     pub installment_count: i32,
     pub callback_received_at: Option<NaiveDateTime>,
     pub created_at: NaiveDateTime,
+    pub invoice_status: Option<String>,
+    pub invoice_no: Option<String>,
+    pub invoice_pdf_url: Option<String>,
 }
 
 const PAYMENT_SELECT: &str = r#"
     SELECT p.id, p.merchant_oid, p.member_id, cu.email, p.subscription_id,
            s.plan, s.billing_cycle, p.amount, p.currency, p.status,
            p.failed_reason_code, p.failed_reason_msg, p.is_3d, p.test_mode,
-           p.installment_count, p.callback_received_at, p.created_at
+           p.installment_count, p.callback_received_at, p.created_at,
+           i.status AS invoice_status, i.invoice_no, i.pdf_url AS invoice_pdf_url
     FROM paytr_payments p
     LEFT JOIN customers cu ON cu.member_id = p.member_id
     LEFT JOIN paytr_subscriptions s ON s.id = p.subscription_id
+    LEFT JOIN invoices i ON i.merchant_oid = p.merchant_oid AND i.kind = 'sale'
 "#;
+
+/// Faturalamanın başladığı andan (ilk fatura kaydı) sonra başarılı olup fatura kaydı olmayan
+/// ödemeler. Normalde 0; callback'te fatura kaydı atlandıysa (bkz. `record_invoice`) artar.
+pub async fn payments_without_invoice(pool: &PgPool) -> Result<i64> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM paytr_payments p
+         WHERE p.status = 'success'
+           AND p.created_at >= (SELECT min(created_at) FROM invoices)
+           AND NOT EXISTS (SELECT 1 FROM invoices i WHERE i.merchant_oid = p.merchant_oid AND i.kind = 'sale')",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
 
 /// Liste filtreleri; handler doğrular (status/kind yalnızca bilinen değerler).
 pub struct PaymentFilter<'a> {

@@ -183,6 +183,10 @@ eq "ödeme success" "$(sql "SELECT status FROM paytr_payments WHERE merchant_oid
 NEW_EXP=$(sql "SELECT expires_at FROM paytr_subscriptions WHERE id=101")
 callback "$P101" success 29900 >/dev/null
 eq "tekrar callback ikinci kez uzatmadı" "$(sql "SELECT expires_at FROM paytr_subscriptions WHERE id=101")" "$NEW_EXP"
+eq "fatura kaydı: tek, bekliyor, KDV dahil %20 ayrımı" "$(sql "SELECT count(*)||'/'||min(status)||'/'||min(net_kurus)||'+'||min(vat_kurus)||'='||min(total_kurus)||'/'||min(vat_rate) FROM invoices WHERE merchant_oid='$P101'")" "1/pending/24917+4983=29900/20"
+eq "fatura: bireysel alıcı (ad + e-posta)" "$(sql "SELECT (buyer->>'type')||'/'||(buyer->>'name')||'/'||(buyer->>'email') FROM invoices WHERE merchant_oid='$P101'")" "individual/A/a@x.test"
+eq "fatura satırı: yenileme dönemi" "$(sql "SELECT (lines->0->>'name') LIKE 'nlink Gold plan aboneliği (aylık) — %.%.% – %.%.%' FROM invoices WHERE merchant_oid='$P101'")" t
+eq "PayTR sorgusuyla işlenen ödemeye de fatura" "$(sql "SELECT count(*) FROM invoices WHERE merchant_oid='paid4x'")" 1
 # Eşzamanlı çift callback: yeni bir yenileme ödemesi üret
 sql "UPDATE paytr_subscriptions SET next_payment_date=$UTC - interval '1 minute', last_renewal_attempt_at=NULL WHERE id=101"
 tick
@@ -191,7 +195,9 @@ callback "$P101B" success 29900 >/dev/null & C1=$!
 callback "$P101B" success 29900 >/dev/null & C2=$!
 wait $C1 $C2
 eq "eşzamanlı çift callback tek uzatma" "$(sql "SELECT expires_at = timestamp '$NEW_EXP' + interval '1 month' FROM paytr_subscriptions WHERE id=101")" t
+eq "eşzamanlı çift callback tek fatura" "$(sql "SELECT count(*) FROM invoices WHERE merchant_oid='$P101B'")" 1
 eq "düşük tutarlı callback aktivasyon yapmaz" "$(sql "UPDATE paytr_subscriptions SET next_payment_date=$UTC, last_renewal_attempt_at=NULL WHERE id=101"; tick; P=$(sql "SELECT merchant_oid FROM paytr_payments WHERE subscription_id=101 AND status='pending' ORDER BY id DESC LIMIT 1"); callback "$P" success 100 >/dev/null; sql "SELECT status FROM paytr_payments WHERE merchant_oid='$P'")" review
+eq "incelemeye alınan ödemeye fatura kaydı yok" "$(sql "SELECT count(*) FROM invoices i JOIN paytr_payments p USING (merchant_oid) WHERE p.status='review'")" 0
 
 echo "== Grace sonrası expire + kart silme"
 sql "UPDATE paytr_subscriptions SET renewal_attempts=3, expires_at=$UTC - interval '5 days' WHERE id=201"
@@ -203,6 +209,22 @@ eq "kartlar silindi (PayTR)" "$(grep -c '"path": "/odeme/capi/delete".*"utoken":
 eq "ikinci utoken'daki kart kendi utoken'ıyla silindi" "$(grep -c '"path": "/odeme/capi/delete".*"utoken": "ut2b",.*"ctoken": "ctut2b"' "$MOCK_LOG")" 1
 eq "PayTR'ın silemediği kart DB'de aktif kaldı (yeniden denenecek)" "$(sql "SELECT count(*) FROM paytr_cards WHERE utoken='ut2bad' AND is_active")" 1
 eq "boşalan utoken pasif, dolu olan aktif" "$(sql "SELECT string_agg(utoken||':'||is_active, ',' ORDER BY utoken) FROM paytr_user_tokens WHERE member_id=2")" "ut2:false,ut2b:false,ut2bad:true"
+
+echo "== Fatura bilgisi (kurumsalda zorunlu alanlar)"
+put() { # path json → HTTP kodu (iç token'la)
+  curl -s -o "$WORK/last.json" -w '%{http_code}' -X PUT "$BASE$1" \
+    -H 'Content-Type: application/json' -H "X-Internal-Token: $TOKEN" -d "$2"
+}
+CORP='{"member_id":3,"kind":"corporate","company_title":"C Bilişim A.Ş.","tax_number":"1234567890","tax_office":"Kadıköy","address":"Örnek Mah. 1. Sok. No:2","city":"İstanbul","district":"Kadıköy"}'
+eq "fatura bilgisi token'sız → 401" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/v1/billing-profile/3")" 401
+get /api/v1/billing-profile/3 >/dev/null
+eq "kayıt yok → null (bireysel sayılır)" "$(pyj "d['profile']")" None
+eq "kurumsal: vergi dairesi eksik → 400" "$(put /api/v1/billing-profile "$(echo "$CORP" | sed 's/"tax_office":"Kadıköy",//')")" 400
+eq "kurumsal: VKN'de harf → 400" "$(put /api/v1/billing-profile "$(echo "$CORP" | sed 's/1234567890/12345678ab/')")" 400
+eq "olmayan üye → 400" "$(put /api/v1/billing-profile "$(echo "$CORP" | sed 's/"member_id":3/"member_id":999/')")" 400
+eq "kurumsal kaydedildi → 200" "$(put /api/v1/billing-profile "$CORP")" 200
+get /api/v1/billing-profile/3 >/dev/null
+eq "kayıtlı bilgi okunuyor" "$(pyj "d['profile']['kind']+'/'+d['profile']['tax_number']+'/'+d['profile']['country']")" "corporate/1234567890/Türkiye"
 
 echo "== Upgrade (Silver → Gold, fark ücreti)"
 eq "upgrade quote → 200" "$(post /api/v1/subscriptions/upgrade-quote '{"member_id":3,"plan":"gold","billing_cycle":"monthly"}' $TOKEN)" 200
@@ -220,6 +242,8 @@ eq "yeni abonelik aktif, kart bağlı" "$(sql "SELECT status||'/'||ctoken FROM p
 eq "eski abonelik replaced" "$(sql "SELECT status FROM paytr_subscriptions WHERE id=301")" replaced
 eq "yeni dönem hemen başladı (1 ay, süre aktarılmadı)" "$(sql "SELECT expires_at BETWEEN $UTC + interval '1 month' - interval '1 hour' AND $UTC + interval '1 month' + interval '1 hour' FROM paytr_subscriptions WHERE id=$NEWSUB")" t
 eq "müşteri Gold" "$(sql "SELECT user_type||'/'||subscription_id FROM customers WHERE member_id=3")" "Gold/$NEWSUB"
+eq "yükseltme faturası: kurumsal alıcı, fark ücreti satırı" "$(sql "SELECT (buyer->>'type')||'/'||(buyer->>'tax_number')||'/'||(lines->0->>'name') FROM invoices WHERE merchant_oid='u3t1'")" "corporate/1234567890/nlink Gold plan yükseltmesi (aylık) — fark ücreti"
+eq "yükseltme faturası tutarı = tahsilat" "$(sql "SELECT total_kurus FROM invoices WHERE merchant_oid='u3t1'")" "$CHARGE_KURUS"
 
 echo "== Geç callback'ler müşteri planını ezmez"
 sql "INSERT INTO paytr_payments(member_id,subscription_id,merchant_oid,amount,is_3d) VALUES (3,301,'late301','149.00',false)"
@@ -270,5 +294,17 @@ eq "abonelik tekrar aktif, plan temiz (müşteri ve abonelik)" "$(sql "SELECT s.
 
 echo
 grep -iE "panic|ERROR" "$SVC_LOG" | grep -v "Yenileme hatası\|Tahsil edilen tutar\|incelemeye alındı" | head -5
+echo "== Muhasebe dışa aktarımı + panelde fatura"
+MONTH=$(TZ=Europe/Istanbul date +%Y-%m)
+eq "geçersiz ay → 400" "$(get '/api/v1/admin/invoices/export?month=2026-13')" 400
+eq "aylık CSV → 200" "$(get "/api/v1/admin/invoices/export?month=$MONTH")" 200
+eq "CSV: bireysel satır, KDV ayrımıyla" "$(grep -c "$P101;1;Bireysel;A;.*;249,17;20;49,83;299,00;pending" "$WORK/last.json")" 1
+eq "CSV: kurumsal satır" "$(grep -c "u3t1;3;Kurumsal;C Bilişim A.Ş.;1234567890;Kadıköy;" "$WORK/last.json")" 1
+eq "CSV: toplam satırı tüm faturaları sayıyor" "$(grep -c "^TOPLAM ($(sql "SELECT count(*) FROM invoices WHERE kind='sale'") fatura)" "$WORK/last.json")" 1
+get /api/v1/admin/overview >/dev/null
+eq "faturası olmayan başarılı ödeme yok" "$(pyj "d['payments_without_invoice']")" 0
+get "/api/v1/admin/payments?q=$P101" >/dev/null
+eq "ödeme listesinde fatura durumu" "$(pyj "d['items'][0]['invoice']['status']")" pending
+
 echo "== Sonuç: $PASS geçti, $FAIL başarısız"
 [ "$FAIL" = 0 ]

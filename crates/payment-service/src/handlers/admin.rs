@@ -95,6 +95,15 @@ pub struct PaymentDto {
     installment_count: i32,
     created_at: String,
     callback_received_at: Option<String>,
+    /// Fatura kaydı yoksa null (faturalama öncesi ödemeler, başarısızlar).
+    invoice: Option<InvoiceRef>,
+}
+
+#[derive(Serialize)]
+pub struct InvoiceRef {
+    status: String,
+    number: Option<String>,
+    pdf_url: Option<String>,
 }
 
 impl From<PaymentRow> for PaymentDto {
@@ -105,6 +114,7 @@ impl From<PaymentRow> for PaymentDto {
             amount_kurus: amount_to_kurus(&p.amount),
             created_at: utc(p.created_at),
             callback_received_at: p.callback_received_at.map(utc),
+            invoice: p.invoice_status.map(|status| InvoiceRef { status, number: p.invoice_no, pdf_url: p.invoice_pdf_url }),
             id: p.id,
             merchant_oid: p.merchant_oid,
             member_id: p.member_id,
@@ -248,17 +258,20 @@ pub struct OverviewResponse {
     failed_7d_by_class: BTreeMap<&'static str, i64>,
     /// Son 30 günde başarılı ödemelerin toplamı (test ödemeleri hariç), kuruş.
     revenue_30d_kurus: i64,
+    /// Faturalama başladıktan sonra başarılı olup fatura kaydı oluşmamış ödemeler (normalde 0).
+    payments_without_invoice: i64,
     subscriptions: Vec<ProblemSubscriptionDto>,
     payments: Vec<PaymentDto>,
 }
 
 /// GET /api/v1/admin/overview — özet sayılar, zamanlayıcı durumu, dikkat isteyen kayıtlar.
 pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse>, AppError> {
-    let (statuses_30d, last_renewal, subs, payments) = tokio::try_join!(
+    let (statuses_30d, last_renewal, subs, payments, payments_without_invoice) = tokio::try_join!(
         admin_repo::recent_statuses(&state.db, 30),
         admin_repo::last_renewal_success(&state.db),
         admin_repo::problem_subscriptions(&state.db),
         admin_repo::attention_payments(&state.db),
+        admin_repo::payments_without_invoice(&state.db),
     )?;
 
     let week_ago = Utc::now().naive_utc() - Duration::days(7);
@@ -296,6 +309,7 @@ pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResp
         counts_7d,
         failed_7d_by_class,
         revenue_30d_kurus,
+        payments_without_invoice,
         subscriptions: subs
             .into_iter()
             .map(|s| problem_dto(s, state.config.grace_days, state.config.max_failed_attempts))
@@ -304,9 +318,127 @@ pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResp
     }))
 }
 
+#[derive(Deserialize)]
+pub struct ExportQuery {
+    /// YYYY-MM (Türkiye saatine göre ay)
+    month: String,
+}
+
+/// Kuruş → "1.234,56" değil "1234,56": Excel'in sayı olarak okuması için binlik ayırıcı yok.
+fn tl_plain(kurus: i64) -> String {
+    let sign = if kurus < 0 { "-" } else { "" };
+    let k = kurus.abs();
+    format!("{sign}{},{:02}", k / 100, k % 100)
+}
+
+/// CSV alanı: `;`, tırnak ya da satır sonu varsa tırnaklanır. Kullanıcı girdisi (unvan, adres)
+/// `= + - @` ile başlıyorsa Excel formül olarak çalıştırmasın diye başına `'` eklenir.
+fn csv_field(s: &str) -> String {
+    let s = if s.starts_with(['=', '+', '-', '@']) { format!("'{s}") } else { s.to_string() };
+    if s.contains([';', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s
+    }
+}
+
+fn month_range_utc(month: &str) -> Option<(NaiveDateTime, NaiveDateTime, String)> {
+    let start = chrono::NaiveDate::parse_from_str(&format!("{month}-01"), "%Y-%m-%d").ok()?;
+    let next = start.checked_add_months(chrono::Months::new(1))?;
+    // Türkiye UTC+3: TR gece yarısı = UTC 21:00 (önceki gün)
+    let to_utc = |d: chrono::NaiveDate| d.and_hms_opt(0, 0, 0).map(|t| t - Duration::hours(3));
+    Some((to_utc(start)?, to_utc(next)?, start.format("%Y-%m").to_string()))
+}
+
+/// GET /api/v1/admin/invoices/export?month=YYYY-MM — muhasebe için aylık satış faturaları
+/// (CSV, `;` ayraçlı, ondalık virgül, UTF-8 BOM: Türkçe Excel doğrudan açar). Son satır toplam.
+pub async fn export_invoices(
+    State(state): State<AppState>,
+    Query(q): Query<ExportQuery>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::{http::header, response::IntoResponse};
+
+    let (from, to, label) =
+        month_range_utc(q.month.trim()).ok_or_else(|| AppError::BadRequest("Ay YYYY-MM biçiminde olmalı".into()))?;
+    let rows = crate::db::billing_repo::sales_between(&state.db, from, to).await?;
+
+    let tz = chrono::FixedOffset::east_opt(3 * 3600).expect("geçerli ofset");
+    let mut out = String::from("\u{feff}");
+    out.push_str("Tarih;Sipariş no;Üye no;Alıcı türü;Alıcı;VKN/TCKN;Vergi dairesi;Adres;E-posta;Açıklama;KDV hariç (TL);KDV oranı (%);KDV (TL);Toplam (TL);Fatura durumu;Fatura no;PDF\r\n");
+    let (mut net, mut vat, mut total) = (0i64, 0i64, 0i64);
+    for r in &rows {
+        let b = &r.buyer;
+        let s = |k: &str| b.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let corporate = s("type") == "corporate";
+        let address = [s("address"), s("district"), s("city")]
+            .into_iter()
+            .filter(|x| !x.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let description = r.lines.get(0).and_then(|l| l.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+        let fields = [
+            r.created_at.and_utc().with_timezone(&tz).format("%d.%m.%Y %H:%M").to_string(),
+            r.merchant_oid.clone(),
+            r.member_id.to_string(),
+            if corporate { "Kurumsal".into() } else { "Bireysel".into() },
+            if corporate { s("title") } else { s("name") },
+            s("tax_number"),
+            s("tax_office"),
+            address,
+            s("email"),
+            description.to_string(),
+            tl_plain(r.net_kurus),
+            r.vat_rate.to_string(),
+            tl_plain(r.vat_kurus),
+            tl_plain(r.total_kurus),
+            r.status.clone(),
+            r.invoice_no.clone().unwrap_or_default(),
+            r.pdf_url.clone().unwrap_or_default(),
+        ];
+        out.push_str(&fields.iter().map(|f| csv_field(f)).collect::<Vec<_>>().join(";"));
+        out.push_str("\r\n");
+        net += r.net_kurus;
+        vat += r.vat_kurus;
+        total += r.total_kurus;
+    }
+    out.push_str(&format!(
+        "TOPLAM ({} fatura);;;;;;;;;;{};;{};{};;;\r\n",
+        rows.len(),
+        tl_plain(net),
+        tl_plain(vat),
+        tl_plain(total)
+    ));
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"nlink-faturalar-{label}.csv\"")),
+        ],
+        out,
+    )
+        .into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_helpers() {
+        assert_eq!(tl_plain(24917), "249,17");
+        assert_eq!(tl_plain(5), "0,05");
+        assert_eq!(tl_plain(-4983), "-49,83");
+        assert_eq!(csv_field("Kodeksa A.Ş."), "Kodeksa A.Ş.");
+        assert_eq!(csv_field("a;b"), "\"a;b\"");
+        assert_eq!(csv_field("say \"x\""), "\"say \"\"x\"\"\"");
+        assert_eq!(csv_field("=HYPERLINK(1)"), "'=HYPERLINK(1)");
+        let (from, to, label) = month_range_utc("2026-10").unwrap();
+        assert_eq!(from.to_string(), "2026-09-30 21:00:00");
+        assert_eq!(to.to_string(), "2026-10-31 21:00:00");
+        assert_eq!(label, "2026-10");
+        assert!(month_range_utc("2026-13").is_none());
+        assert!(month_range_utc("x").is_none());
+    }
 
     #[test]
     fn kind_from_merchant_oid() {

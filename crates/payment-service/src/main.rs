@@ -1,3 +1,4 @@
+mod billing;
 mod config;
 mod cards;
 mod crypto;
@@ -20,7 +21,7 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use tower_http::trace::TraceLayer;
@@ -118,6 +119,10 @@ async fn main() -> anyhow::Result<()> {
         // Yönetici paneli (salt-okunur); admin yetkisi Next.js tarafında doğrulanır.
         .route("/api/v1/admin/payments", get(handlers::admin::list_payments))
         .route("/api/v1/admin/overview", get(handlers::admin::overview))
+        .route("/api/v1/admin/invoices/export", get(handlers::admin::export_invoices))
+        // Üyenin fatura bilgisi; member_id Next.js'te oturumdan alınır.
+        .route("/api/v1/billing-profile/:member_id", get(handlers::billing::get_profile))
+        .route("/api/v1/billing-profile", put(handlers::billing::save_profile))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&state), require_internal_token));
 
     let app = Router::new()

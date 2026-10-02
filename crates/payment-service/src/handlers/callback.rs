@@ -1,8 +1,13 @@
 use axum::{extract::State, response::IntoResponse, Form};
 
 use crate::{
+    billing,
     crypto::{generate_card_list_token, verify_callback_hash},
-    db::{card_repo, customer_repo, models::PaytrSubscription, payment_repo, subscription_repo},
+    db::{
+        billing_repo, card_repo, customer_repo,
+        models::{PaytrPaymentRecord, PaytrSubscription},
+        payment_repo, subscription_repo,
+    },
     email, email_templates,
     error::AppError,
     models::{
@@ -60,6 +65,46 @@ fn first_payment_conflicts(sub: &PaytrSubscription, others: &[PaytrSubscription]
         let allowed = upgrade_from == Some(o.id as i64) || (legacy_upgrade && o.created_at < sub.created_at);
         !allowed
     })
+}
+
+/// Başarılı ödemenin fatura kaydı — ödemeyle aynı transaction içinde, bir savepoint'te.
+/// Normalde ikisi birlikte yazılır; fatura tarafında beklenmedik bir hata olursa yalnızca
+/// savepoint geri alınır ve ödeme yine işlenir (fatura hatası abonelik aktivasyonunu
+/// engellemesin). Atlanan kayıt loglanır ve panelde "faturası olmayan ödeme" olarak görünür.
+async fn record_invoice(
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    payment: &PaytrPaymentRecord,
+    subject: billing::InvoiceSubject<'_>,
+) {
+    let Some(total) = amount_to_kurus(&payment.amount).filter(|k| *k > 0) else {
+        tracing::error!(merchant_oid = %payment.merchant_oid, amount = %payment.amount, "Fatura kaydı atlandı: tutar okunamadı");
+        return;
+    };
+    let result: anyhow::Result<()> = async {
+        let mut sp = sqlx::Acquire::begin(&mut **tx).await?;
+        let profile = billing_repo::find_profile(&mut *sp, payment.member_id).await?;
+        let (name, email) = billing_repo::customer_contact(&mut *sp, payment.member_id).await?;
+        let created = billing_repo::create_sale(
+            &mut *sp,
+            billing_repo::NewInvoice {
+                payment_id: payment.id,
+                merchant_oid: &payment.merchant_oid,
+                member_id: payment.member_id,
+                buyer: billing::buyer_snapshot(profile.as_ref(), &name, &email),
+                line: billing::single_line(billing::line_description(&subject), total),
+            },
+        )
+        .await?;
+        sp.commit().await?;
+        if !created {
+            tracing::info!(merchant_oid = %payment.merchant_oid, "Fatura kaydı zaten var");
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = result {
+        tracing::error!(merchant_oid = %payment.merchant_oid, "Fatura kaydı oluşturulamadı (ödeme yine işlendi): {:?}", e);
+    }
 }
 
 /// Yöneticiye inceleme uyarısı (e-posta yapılandırılmamışsa yalnızca log).
@@ -172,6 +217,7 @@ pub(crate) async fn handle_success(state: &crate::AppData, payload: &CallbackPay
     }
 
     let Some(subscription_id) = payment.subscription_id else {
+        record_invoice(&mut tx, &payment, billing::InvoiceSubject::Other).await;
         payment_repo::set_success(&mut *tx, &payload.merchant_oid)
             .await
             .map_err(anyhow::Error::from)?;
@@ -315,6 +361,19 @@ pub(crate) async fn handle_success(state: &crate::AppData, payload: &CallbackPay
     )
     .await
     .map_err(anyhow::Error::from)?;
+
+    let is_upgrade = is_first_payment && sub.metadata.as_ref().is_some_and(|m| m.get("upgrade_from").is_some());
+    let subject = if is_upgrade {
+        billing::InvoiceSubject::Upgrade { plan: &effective_plan, billing_cycle: &sub.billing_cycle }
+    } else {
+        billing::InvoiceSubject::Period {
+            plan: &effective_plan,
+            billing_cycle: &sub.billing_cycle,
+            start: period_start,
+            end: expires_at,
+        }
+    };
+    record_invoice(&mut tx, &payment, subject).await;
 
     payment_repo::set_success(&mut *tx, &payload.merchant_oid)
         .await
