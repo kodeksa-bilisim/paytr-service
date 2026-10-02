@@ -419,6 +419,109 @@ pub async fn export_invoices(
         .into_response())
 }
 
+#[derive(Deserialize)]
+pub struct BackfillQuery {
+    /// Varsayılan true: yalnızca ne yapılacağını listeler, yazmaz.
+    dry_run: Option<bool>,
+}
+
+#[derive(Serialize)]
+pub struct BackfillItem {
+    merchant_oid: String,
+    member_id: i32,
+    paid_at: String,
+    total_kurus: Option<i64>,
+    description: Option<String>,
+    /// `create` | `created` | `exists` (bu sırada başka yerden oluştu) | `skipped`
+    action: &'static str,
+    reason: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+pub struct BackfillResponse {
+    dry_run: bool,
+    candidates: usize,
+    created: usize,
+    skipped: usize,
+    items: Vec<BackfillItem>,
+}
+
+/// POST /api/v1/admin/invoices/backfill?dry_run=true|false — fatura kaydı olmayan başarılı
+/// (test dışı) ödemeler için geriye dönük fatura kaydı. Kayıt ödeme anına tarihlenir (aylık
+/// CSV'de doğru aya düşer), `provider = 'backfill'` ile işaretlenir, durumu `pending`.
+/// Bu ödemeler e-belge aktivasyonundan önce olduğu için entegratör üzerinden kesilemez;
+/// muhasebeci CSV'den elle keser. Tekrar çalıştırmak güvenli (ödeme başına tek fatura).
+pub async fn backfill_invoices(
+    State(state): State<AppState>,
+    Query(q): Query<BackfillQuery>,
+) -> Result<Json<BackfillResponse>, AppError> {
+    use crate::{billing, db::billing_repo};
+
+    let dry_run = q.dry_run.unwrap_or(true);
+    let candidates = billing_repo::uninvoiced_payments(&state.db).await?;
+    let mut items = Vec::with_capacity(candidates.len());
+    let (mut created, mut skipped) = (0, 0);
+
+    for p in &candidates {
+        let total = amount_to_kurus(&p.amount).filter(|k| *k > 0);
+        let subject = match (p.plan.as_deref(), p.billing_cycle.as_deref()) {
+            (Some(plan), Some(cycle)) if payment_kind(&p.merchant_oid) != "renewal" && p.is_upgrade => {
+                billing::InvoiceSubject::Upgrade { plan, billing_cycle: cycle }
+            }
+            (Some(plan), Some(cycle)) => billing::InvoiceSubject::Untimed {
+                plan,
+                billing_cycle: cycle,
+                renewal: payment_kind(&p.merchant_oid) == "renewal",
+            },
+            _ => billing::InvoiceSubject::Other,
+        };
+        let description = billing::line_description(&subject);
+        let mut item = BackfillItem {
+            merchant_oid: p.merchant_oid.clone(),
+            member_id: p.member_id,
+            paid_at: utc(p.paid_at),
+            total_kurus: total,
+            description: Some(description.clone()),
+            action: "create",
+            reason: None,
+        };
+        let Some(total) = total else {
+            item.action = "skipped";
+            item.reason = Some("tutar okunamadı");
+            skipped += 1;
+            items.push(item);
+            continue;
+        };
+        if !dry_run {
+            let profile = billing_repo::find_profile(&state.db, p.member_id).await?;
+            let (name, email) = billing_repo::customer_contact(&state.db, p.member_id).await?;
+            let inserted = billing_repo::create_sale(
+                &state.db,
+                billing_repo::NewInvoice {
+                    payment_id: p.id,
+                    merchant_oid: &p.merchant_oid,
+                    member_id: p.member_id,
+                    buyer: billing::buyer_snapshot(profile.as_ref(), &name, &email),
+                    line: billing::single_line(description, total),
+                    created_at: Some(p.paid_at),
+                    source: Some("backfill"),
+                },
+            )
+            .await?;
+            if inserted {
+                item.action = "created";
+                created += 1;
+            } else {
+                item.action = "exists";
+            }
+        }
+        items.push(item);
+    }
+
+    tracing::info!(dry_run, candidates = candidates.len(), created, skipped, "Geriye dönük fatura kaydı");
+    Ok(Json(BackfillResponse { dry_run, candidates: candidates.len(), created, skipped, items }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

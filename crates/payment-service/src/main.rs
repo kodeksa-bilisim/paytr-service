@@ -120,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/admin/payments", get(handlers::admin::list_payments))
         .route("/api/v1/admin/overview", get(handlers::admin::overview))
         .route("/api/v1/admin/invoices/export", get(handlers::admin::export_invoices))
+        .route("/api/v1/admin/invoices/backfill", post(handlers::admin::backfill_invoices))
         // Üyenin fatura bilgisi; member_id Next.js'te oturumdan alınır.
         .route("/api/v1/billing-profile/:member_id", get(handlers::billing::get_profile))
         .route("/api/v1/billing-profile", put(handlers::billing::save_profile))

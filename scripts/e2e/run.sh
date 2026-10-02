@@ -306,5 +306,26 @@ eq "faturası olmayan başarılı ödeme yok" "$(pyj "d['payments_without_invoic
 get "/api/v1/admin/payments?q=$P101" >/dev/null
 eq "ödeme listesinde fatura durumu" "$(pyj "d['items'][0]['invoice']['status']")" pending
 
+echo "== Geriye dönük fatura kaydı"
+# Faturalama öncesinden kalmış başarılı ödemeler: biri normal, biri test modu, biri okunamayan tutar
+sql "INSERT INTO paytr_payments(member_id,subscription_id,merchant_oid,amount,status,is_3d,test_mode,created_at,callback_received_at) VALUES
+     (1,101,'r101t1000','299.00','success',false,false,$UTC - interval '40 days',$UTC - interval '40 days'),
+     (1,101,'u1t2000',  '299.00','success',true, true, $UTC - interval '40 days',$UTC - interval '40 days'),
+     (1,101,'r101t3000','abc',   'success',false,false,$UTC - interval '39 days',$UTC - interval '39 days');"
+eq "backfill token'sız → 401" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/admin/invoices/backfill")" 401
+eq "deneme modu (varsayılan) → 200" "$(post /api/v1/admin/invoices/backfill '' $TOKEN)" 200
+eq "deneme: 2 aday (test ödemesi hariç), hiçbir şey yazılmadı" "$(pyj "f\"{d['dry_run']}/{d['candidates']}/{d['created']}/{d['skipped']}\"")/$(sql "SELECT count(*) FROM invoices WHERE merchant_oid IN ('r101t1000','r101t3000','u1t2000')")" "True/2/0/1/0"
+eq "gerçek çalıştırma → 200" "$(post '/api/v1/admin/invoices/backfill?dry_run=false' '' $TOKEN)" 200
+eq "1 oluşturuldu, okunamayan tutar atlandı" "$(pyj "f\"{d['created']}/{d['skipped']}/\" + ','.join(i['action'] for i in d['items'])")" "1/1/created,skipped"
+eq "kayıt ödeme anına tarihli, işaretli, açıklamalı" "$(sql "SELECT provider||'/'||status||'/'||(created_at = (SELECT callback_received_at FROM paytr_payments WHERE merchant_oid='r101t1000'))||'/'||(lines->0->>'name')||'/'||total_kurus FROM invoices WHERE merchant_oid='r101t1000'")" "backfill/pending/true/nlink Gold plan aboneliği (aylık) — yenileme/29900"
+eq "test ödemesine fatura kaydı yok" "$(sql "SELECT count(*) FROM invoices WHERE merchant_oid='u1t2000'")" 0
+post '/api/v1/admin/invoices/backfill?dry_run=false' '' $TOKEN >/dev/null
+eq "tekrar çalıştırmak güvenli (yeni kayıt yok)" "$(pyj "d['created']")/$(sql "SELECT count(*) FROM invoices WHERE merchant_oid='r101t1000'")" "0/1"
+OLD_MONTH=$(TZ=Europe/Istanbul date -d '-40 days' +%Y-%m)
+get "/api/v1/admin/invoices/export?month=$OLD_MONTH" >/dev/null
+eq "geriye dönük kayıt ödeme ayının CSV'sinde" "$(grep -c "r101t1000;1;Bireysel;A;" "$WORK/last.json")" 1
+get /api/v1/admin/overview >/dev/null
+eq "okunamayan tutarlı ödeme panelde uyarı olarak kalır" "$(pyj "d['payments_without_invoice']")" 1
+
 echo "== Sonuç: $PASS geçti, $FAIL başarısız"
 [ "$FAIL" = 0 ]

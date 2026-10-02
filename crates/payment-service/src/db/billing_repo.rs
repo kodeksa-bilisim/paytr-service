@@ -61,6 +61,10 @@ pub struct NewInvoice<'a> {
     pub member_id: i32,
     pub buyer: serde_json::Value,
     pub line: InvoiceLine,
+    /// Geriye dönük kayıtta ödeme anı (CSV'de doğru aya düşsün); normalde None = şimdi.
+    pub created_at: Option<NaiveDateTime>,
+    /// Kaydın kaynağı: None = callback, "backfill" = geriye dönük.
+    pub source: Option<&'a str>,
 }
 
 /// Satış faturası kaydı (`pending`). Aynı ödemeye ikinci kez oluşturulmaz.
@@ -69,8 +73,8 @@ pub async fn create_sale<'e>(ex: impl PgExecutor<'e>, inv: NewInvoice<'_>) -> Re
         r#"
         INSERT INTO invoices
             (payment_id, merchant_oid, member_id, kind, buyer, lines, vat_rate,
-             net_kurus, vat_kurus, total_kurus)
-        VALUES ($1, $2, $3, 'sale', $4, $5, $6, $7, $8, $9)
+             net_kurus, vat_kurus, total_kurus, created_at, provider)
+        VALUES ($1, $2, $3, 'sale', $4, $5, $6, $7, $8, $9, COALESCE($10, NOW()), $11)
         ON CONFLICT (merchant_oid, kind) DO NOTHING
         "#,
     )
@@ -83,9 +87,42 @@ pub async fn create_sale<'e>(ex: impl PgExecutor<'e>, inv: NewInvoice<'_>) -> Re
     .bind(inv.line.net_kurus)
     .bind(inv.line.vat_kurus)
     .bind(inv.line.total_kurus)
+    .bind(inv.created_at)
+    .bind(inv.source)
     .execute(ex)
     .await?;
     Ok(r.rows_affected() > 0)
+}
+
+/// Fatura kaydı olmayan başarılı (test dışı) ödeme — geriye dönük kayıt adayı.
+#[derive(Debug, sqlx::FromRow)]
+pub struct UninvoicedPayment {
+    pub id: i32,
+    pub merchant_oid: String,
+    pub member_id: i32,
+    pub amount: String,
+    pub paid_at: NaiveDateTime,
+    pub plan: Option<String>,
+    pub billing_cycle: Option<String>,
+    pub is_upgrade: bool,
+}
+
+pub async fn uninvoiced_payments(pool: &PgPool) -> Result<Vec<UninvoicedPayment>> {
+    Ok(sqlx::query_as::<_, UninvoicedPayment>(
+        r#"
+        SELECT p.id, p.merchant_oid, p.member_id, p.amount,
+               COALESCE(p.callback_received_at, p.created_at)     AS paid_at,
+               s.plan, s.billing_cycle,
+               COALESCE(s.metadata ? 'upgrade_from', FALSE)       AS is_upgrade
+        FROM paytr_payments p
+        LEFT JOIN paytr_subscriptions s ON s.id = p.subscription_id
+        WHERE p.status = 'success' AND NOT p.test_mode
+          AND NOT EXISTS (SELECT 1 FROM invoices i WHERE i.merchant_oid = p.merchant_oid AND i.kind = 'sale')
+        ORDER BY paid_at, p.id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?)
 }
 
 /// Muhasebe dışa aktarımı için fatura satırı.

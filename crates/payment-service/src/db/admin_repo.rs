@@ -46,7 +46,7 @@ const PAYMENT_SELECT: &str = r#"
 pub async fn payments_without_invoice(pool: &PgPool) -> Result<i64> {
     let n: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM paytr_payments p
-         WHERE p.status = 'success'
+         WHERE p.status = 'success' AND NOT p.test_mode
            AND p.created_at >= (SELECT min(created_at) FROM invoices)
            AND NOT EXISTS (SELECT 1 FROM invoices i WHERE i.merchant_oid = p.merchant_oid AND i.kind = 'sale')",
     )

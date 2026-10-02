@@ -92,6 +92,8 @@ async fn record_invoice(
                 member_id: payment.member_id,
                 buyer: billing::buyer_snapshot(profile.as_ref(), &name, &email),
                 line: billing::single_line(billing::line_description(&subject), total),
+                created_at: None,
+                source: None,
             },
         )
         .await?;

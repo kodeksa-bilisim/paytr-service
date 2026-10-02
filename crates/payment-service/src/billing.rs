@@ -23,6 +23,9 @@ pub enum InvoiceSubject<'a> {
     Period { plan: &'a str, billing_cycle: &'a str, start: NaiveDateTime, end: NaiveDateTime },
     /// Yükseltme: yalnızca fark ücreti alındı.
     Upgrade { plan: &'a str, billing_cycle: &'a str },
+    /// Dönem tarihleri bilinmeyen abonelik ödemesi (geriye dönük kayıt: abonelik o günden beri
+    /// değişmiş olabilir, dönem yeniden hesaplanamaz).
+    Untimed { plan: &'a str, billing_cycle: &'a str, renewal: bool },
     /// Aboneliğe bağlanamayan tahsilat.
     Other,
 }
@@ -46,6 +49,12 @@ pub fn line_description(subject: &InvoiceSubject) -> String {
             "nlink {} plan yükseltmesi ({}) — fark ücreti",
             plan_label(plan),
             cycle_label(billing_cycle)
+        ),
+        InvoiceSubject::Untimed { plan, billing_cycle, renewal } => format!(
+            "nlink {} plan aboneliği ({}){}",
+            plan_label(plan),
+            cycle_label(billing_cycle),
+            if *renewal { " — yenileme" } else { "" }
         ),
         InvoiceSubject::Other => "nlink hizmet bedeli".to_string(),
     }
@@ -189,6 +198,14 @@ mod tests {
         assert_eq!(
             line_description(&InvoiceSubject::Upgrade { plan: "gold", billing_cycle: "monthly" }),
             "nlink Gold plan yükseltmesi (aylık) — fark ücreti"
+        );
+        assert_eq!(
+            line_description(&InvoiceSubject::Untimed { plan: "gold", billing_cycle: "monthly", renewal: true }),
+            "nlink Gold plan aboneliği (aylık) — yenileme"
+        );
+        assert_eq!(
+            line_description(&InvoiceSubject::Untimed { plan: "silver", billing_cycle: "yearly", renewal: false }),
+            "nlink Silver plan aboneliği (yıllık)"
         );
     }
 
