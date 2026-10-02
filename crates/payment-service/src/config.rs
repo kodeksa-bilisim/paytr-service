@@ -49,6 +49,9 @@ pub struct Config {
     /// şirket kartıyla kendi hizmetine ödeyen hesaplar satış değildir. Ödemelerine fatura kaydı
     /// açılmaz, paneldeki tahsilata ve "faturası olmayan ödeme" uyarısına girmez.
     pub invoice_exempt_members: Vec<i32>,
+    /// Dış izlemenin heartbeat adresi (`HEARTBEAT_URL_SCHEDULER`, ör. Better Stack). Her başarılı
+    /// scheduler çalışmasından sonra GET atılır; ping gelmezse izleme servisi uyarı verir.
+    pub heartbeat_url: Option<String>,
 }
 
 /// "1, 7,x" → [1, 7]; geçersiz parçalar yok sayılır.
@@ -76,6 +79,7 @@ impl std::fmt::Debug for Config {
             .field("grace_days", &self.grace_days)
             .field("sync_mode", &self.sync_mode)
             .field("invoice_exempt_members", &self.invoice_exempt_members)
+            .field("heartbeat_url", &self.heartbeat_url.as_ref().map(|_| "[SET]"))
             .field("internal_api_token", &"[REDACTED]")
             .finish()
     }
@@ -145,6 +149,10 @@ impl Config {
                 .unwrap_or_else(|| "5305861333".to_string()),
             sync_mode: std::env::var("PAYTR_SYNC_MODE").is_ok_and(|v| v.trim() == "1"),
             invoice_exempt_members: parse_member_ids(&std::env::var("INVOICE_EXEMPT_MEMBERS").unwrap_or_default()),
+            heartbeat_url: std::env::var("HEARTBEAT_URL_SCHEDULER")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| s.starts_with("https://")),
         })
     }
 }

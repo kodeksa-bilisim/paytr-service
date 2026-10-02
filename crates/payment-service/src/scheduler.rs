@@ -46,14 +46,28 @@ pub fn start(state: AppState) {
 
             let run_state = state.clone();
             match tokio::spawn(async move { process_due(&run_state).await }).await {
-                Ok(Ok(())) => state
-                    .scheduler_last_ok
-                    .store(Utc::now().timestamp(), std::sync::atomic::Ordering::Relaxed),
+                Ok(Ok(())) => {
+                    state
+                        .scheduler_last_ok
+                        .store(Utc::now().timestamp(), std::sync::atomic::Ordering::Relaxed);
+                    ping_heartbeat(&state).await;
+                }
                 Ok(Err(e)) => tracing::error!("Scheduler genel hatası: {:?}", e),
                 Err(e) => tracing::error!("Scheduler çalışması panic ile düştü, sonraki çalışmada devam: {:?}", e),
             }
         }
     });
+}
+
+/// Dış izlemeye "scheduler çalıştı" sinyali. Best-effort: izleme servisinin hatası ya da
+/// yavaşlığı scheduler'ı etkilemez (5 sn sınır, hata yalnızca uyarı log'u).
+async fn ping_heartbeat(state: &AppState) {
+    let Some(url) = state.config.heartbeat_url.as_deref() else { return };
+    match state.http.get(url).timeout(Duration::from_secs(5)).send().await {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => tracing::warn!(status = %r.status(), "Scheduler heartbeat reddedildi"),
+        Err(e) => tracing::warn!(error = %e, "Scheduler heartbeat gönderilemedi"),
+    }
 }
 
 /// PayTR durum sorgusu sonucu.
