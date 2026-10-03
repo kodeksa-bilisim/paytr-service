@@ -334,5 +334,21 @@ eq "geriye dönük kayıt ödeme ayının CSV'sinde" "$(grep -c "r101t1000;1;Bir
 get /api/v1/admin/overview >/dev/null
 eq "okunamayan tutarlı ödeme panelde uyarı olarak kalır" "$(pyj "d['payments_without_invoice']")" 1
 
+echo "== Hesap silme / KVKK dışa aktarma (üye 3: kurumsal fatura bilgisi, faturalı ödeme, kart)"
+eq "dışa aktarma token'sız → 401" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/v1/members/3/export")" 401
+eq "dışa aktarma → 200" "$(get /api/v1/members/3/export)" 200
+eq "abonelik, ödeme, fatura, fatura bilgisi ve kart var" "$(pyj "f\"{len(d['subscriptions'])>0}/{len(d['payments'])>0}/{len(d['invoices'])>0}/{d['billing_profile']['kind']}/{len(d['saved_cards'])>0}\"")" "True/True/True/corporate/True"
+eq "dışa aktarmada kart token'ı yok" "$(grep -c 'ctoken\|utoken\|ctut3' "$WORK/last.json")" 0
+eq "yenileme durdurma → 200" "$(post /api/v1/members/3/stop-renewal '' $TOKEN)" 200
+eq "aktif abonelik iptal edildi (dönem sonuna kadar geçerli)" "$(sql "SELECT count(*) FILTER (WHERE status='active')||'/'||count(*) FILTER (WHERE status='cancelled' AND expires_at > $UTC) FROM paytr_subscriptions WHERE member_id=3")" "0/1"
+INV3=$(sql "SELECT count(*) FROM invoices WHERE member_id=3")
+PAY3=$(sql "SELECT count(*) FROM paytr_payments WHERE member_id=3")
+eq "kalıcı silme → 200" "$(post /api/v1/members/3/erase '' $TOKEN)" 200
+eq "PayTR'daki kartların hepsi silindi" "$(pyj "d['cards_remaining']")/$(sql "SELECT count(*) FROM paytr_cards c JOIN paytr_user_tokens t USING(utoken) WHERE t.member_id=3")" "0/0"
+eq "abonelikler sonlandı, iletişim bilgisi silindi" "$(sql "SELECT count(*) FILTER (WHERE status IN ('active','pending','cancelled'))||'/'||count(user_email)||'/'||count(user_phone) FROM paytr_subscriptions WHERE member_id=3")" "0/0/0"
+eq "fatura bilgisi silindi" "$(sql "SELECT count(*) FROM billing_profiles WHERE member_id=3")" 0
+eq "ödeme ve fatura kayıtları saklandı (yasal)" "$(sql "SELECT count(*) FROM invoices WHERE member_id=3")/$(sql "SELECT count(*) FROM paytr_payments WHERE member_id=3")" "$INV3/$PAY3"
+eq "kalıcı silme tekrar çağrılabilir" "$(post /api/v1/members/3/erase '' $TOKEN)" 200
+
 echo "== Sonuç: $PASS geçti, $FAIL başarısız"
 [ "$FAIL" = 0 ]

@@ -124,6 +124,10 @@ async fn main() -> anyhow::Result<()> {
         // Üyenin fatura bilgisi; member_id Next.js'te oturumdan alınır.
         .route("/api/v1/billing-profile/:member_id", get(handlers::billing::get_profile))
         .route("/api/v1/billing-profile", put(handlers::billing::save_profile))
+        // Hesap silme / KVKK dışa aktarma (qurlbackend)
+        .route("/api/v1/members/:member_id/stop-renewal", post(handlers::member::stop_renewal))
+        .route("/api/v1/members/:member_id/erase", post(handlers::member::erase))
+        .route("/api/v1/members/:member_id/export", get(handlers::member::export))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&state), require_internal_token));
 
     let app = Router::new()
