@@ -5,15 +5,22 @@ use chrono::Utc;
 use crate::{
     cards,
     crypto::{generate_payment_token, generate_status_query_token},
-    db::{customer_repo, models::PaytrPaymentRecord, payment_repo, subscription_repo},
+    db::{customer_repo, growth_repo, models::PaytrPaymentRecord, payment_repo, subscription_repo},
     db::subscription_repo::DueSubscription,
     email, email_templates,
     handlers::callback,
     models::callback::CallbackPayload,
     paytr_client,
-    pricing::{amount_to_kurus, format_tl, tl_to_kurus},
+    pricing::{amount_to_kurus, format_tl, tl_to_kurus, REFERRAL_CREDIT_KURUS},
     AppState,
 };
+
+/// Deneme bitiş hatırlatması: bitişe bu kadar saat kala.
+const TRIAL_REMIND_HOURS: i32 = 48;
+/// Referans ödülü, davet edilenin ilk ödemesinden bu kadar gün sonra (iade/cayma süresi).
+const REFERRAL_WAIT_DAYS: i32 = 14;
+/// Davet edenin yılda alabileceği en fazla ödül.
+const REFERRAL_MAX_PER_YEAR: i64 = 12;
 
 /// Callback'i gelmemiş pending ödemeler bu kadar saat sonra PayTR'a sorulur.
 const STALE_PENDING_HOURS: i32 = 48;
@@ -289,7 +296,103 @@ pub async fn process_due(state: &AppState) -> anyhow::Result<()> {
     expire_subscriptions(state).await?;
     // Daha önce silinemeyen kartları yeniden dene.
     cards::retry_orphan_cards(state).await;
+    // Ücretsiz deneme hatırlatması ve referans ödülleri.
+    remind_ending_trials(state).await;
+    grant_referral_rewards(state).await;
 
+    Ok(())
+}
+
+/// Ücretsiz denemesinin bitmesine 48 saatten az kalan üyelere bir kez e-posta.
+async fn remind_ending_trials(state: &AppState) {
+    let trials = match subscription_repo::trials_ending(&state.db, TRIAL_REMIND_HOURS).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(error = %e, "Biten denemeler okunamadı");
+            return;
+        }
+    };
+    for (id, member_id, to, ends_at) in trials {
+        if let (Some(mailer), Some(cfg), false) = (&state.mailer, &state.config.email, to.is_empty()) {
+            let name = customer_repo::find_name(&state.db, member_id).await;
+            let content = email_templates::trial_ending(name.as_deref(), "gold", ends_at, &cfg.site_url);
+            email::send(mailer, cfg, &to, content).await;
+        }
+        if let Err(e) = subscription_repo::mark_trial_reminded(&state.db, id).await {
+            tracing::error!(subscription_id = id, error = %e, "Deneme hatırlatması işaretlenemedi");
+        }
+    }
+}
+
+/// İlk ödemesinden `REFERRAL_WAIT_DAYS` gün geçmiş davetler için davet edene ödül: geçerli ücretli
+/// aboneliği varsa +1 ay, yoksa 1 aylık Gold değerinde kredi. Ödeme geçersizse ödül yok; yılda
+/// en fazla `REFERRAL_MAX_PER_YEAR` ödül.
+async fn grant_referral_rewards(state: &AppState) {
+    let due = match growth_repo::due_rewards(&state.db, REFERRAL_WAIT_DAYS, 50).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, "Referans ödülleri okunamadı");
+            return;
+        }
+    };
+    for r in due {
+        if let Err(e) = grant_one_reward(state, &r).await {
+            tracing::error!(referred = r.referred_id, referrer = r.referrer_id, error = %e, "Referans ödülü verilemedi");
+        }
+    }
+}
+
+async fn grant_one_reward(state: &AppState, r: &growth_repo::DueReward) -> anyhow::Result<()> {
+    let paid = match r.first_payment_oid.as_deref() {
+        Some(oid) => payment_repo::find_by_oid(&state.db, oid).await?.is_some_and(|p| p.status == "success"),
+        None => false,
+    };
+    if !paid {
+        growth_repo::mark_rewarded(&state.db, r.referred_id, "void").await?;
+        tracing::warn!(referred = r.referred_id, "Referans ödülü verilmedi: ilk ödeme geçerli değil");
+        return Ok(());
+    }
+    if growth_repo::rewards_last_year(&state.db, r.referrer_id).await? >= REFERRAL_MAX_PER_YEAR {
+        growth_repo::mark_rewarded(&state.db, r.referred_id, "capped").await?;
+        return Ok(());
+    }
+
+    let mut tx = state.db.begin().await?;
+    let extended = subscription_repo::extend_one_month(&mut *tx, r.referrer_id).await?;
+    let reward = match extended {
+        Some((sub_id, until)) => {
+            customer_repo::sync_extended(&mut *tx, r.referrer_id, sub_id, until).await?;
+            "extension"
+        }
+        None => {
+            growth_repo::add_credit(&mut *tx, r.referrer_id, REFERRAL_CREDIT_KURUS, "referral", &r.referred_id.to_string()).await?;
+            "credit"
+        }
+    };
+    if !growth_repo::mark_rewarded(&mut *tx, r.referred_id, reward).await? {
+        // Eşzamanlı başka bir çalışma ödüllendirdi.
+        tx.rollback().await?;
+        return Ok(());
+    }
+    tx.commit().await?;
+    tracing::info!(referrer = r.referrer_id, referred = r.referred_id, reward, "Referans ödülü verildi");
+
+    if let (Some(mailer), Some(cfg)) = (&state.mailer, &state.config.email) {
+        let to: Option<String> = sqlx::query_scalar("SELECT email FROM customers WHERE member_id = $1 AND COALESCE(is_active, true)")
+            .bind(r.referrer_id)
+            .fetch_optional(&state.db)
+            .await?;
+        if let Some(to) = to.filter(|t| !t.is_empty()) {
+            let name = customer_repo::find_name(&state.db, r.referrer_id).await;
+            let content = email_templates::referral_reward(
+                name.as_deref(),
+                extended.map(|(_, until)| until),
+                &format_tl(REFERRAL_CREDIT_KURUS),
+                &cfg.site_url,
+            );
+            email::send(mailer, cfg, &to, content).await;
+        }
+    }
     Ok(())
 }
 
@@ -432,9 +535,17 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> Result<(), ChargeErr
 
     // Tutar normalize edilir: kayıtta "149.00" (TL) ya da eski biçimde kuruş olabilir; PayTR
     // TL bekler (ham "14900" gönderilseydi 14.900 TL çekilmeye çalışılırdı).
-    let amount_kurus = amount_to_kurus(&sub.amount)
+    let list_kurus = amount_to_kurus(&sub.amount)
         .filter(|k| *k > 0)
         .ok_or_else(|| anyhow::anyhow!("Geçersiz abonelik tutarı: {}", sub.amount))?;
+    // Kupon "ilk N ay / süresiz" ise yenilemede de indirim uygulanır (sayaç callback'te azalır).
+    let discount = sub
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("discount"))
+        .and_then(|d| serde_json::from_value::<crate::pricing::Discount>(d.clone()).ok())
+        .filter(|d| d.applies_to_renewal());
+    let amount_kurus = list_kurus - discount.map_or(0, |d| d.amount_off(list_kurus));
     let amount = format_tl(amount_kurus);
 
     let phone = if sub.user_phone.trim().is_empty() { state.config.fallback_phone.as_str() } else { sub.user_phone.as_str() };

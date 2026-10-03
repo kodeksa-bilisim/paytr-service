@@ -350,5 +350,100 @@ eq "fatura bilgisi silindi" "$(sql "SELECT count(*) FROM billing_profiles WHERE 
 eq "ödeme ve fatura kayıtları saklandı (yasal)" "$(sql "SELECT count(*) FROM invoices WHERE member_id=3")/$(sql "SELECT count(*) FROM paytr_payments WHERE member_id=3")" "$INV3/$PAY3"
 eq "kalıcı silme tekrar çağrılabilir" "$(post /api/v1/members/3/erase '' $TOKEN)" 200
 
+echo "== Kupon (Gold %30, ilk 2 ödeme, 1 kullanım)"
+sql "INSERT INTO customers (member_id,name,email,user_type) VALUES
+ (20,'K20','k20@x.test','Standard'), (21,'K21','k21@x.test','Standard'), (22,'K22','k22@x.test','Standard'),
+ (23,'K23','k23@x.test','Standard'), (24,'K24','k24@x.test','Standard');"
+gold_init() { # member oid [ek alanlar]
+  echo "$INIT" | sed "s/\"member_id\":3/\"member_id\":$1/; s/u3t1/$2/; s/\"email\":\"c@x.test\"/\"email\":\"k$1@x.test\"/; s/}\$/${3:-}}/"
+}
+eq "kupon token'sız → 401" "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{}' "$BASE/api/v1/admin/coupons")" 401
+eq "yüzde 150 → 400" "$(post /api/v1/admin/coupons '{"code":"BAD150","kind":"percent","value":"150"}' $TOKEN)" 400
+eq "kupon oluşturuldu" "$(post /api/v1/admin/coupons '{"code":"yaz30","kind":"percent","value":"30","plans":["gold"],"duration_cycles":2,"max_redemptions":1}' $TOKEN)" 200
+eq "aynı kod tekrar → 400" "$(post /api/v1/admin/coupons '{"code":"YAZ30","kind":"fixed","value":"50"}' $TOKEN)" 400
+eq "Silver'da geçersiz → 400" "$(post /api/v1/subscriptions/upgrade-quote '{"member_id":20,"plan":"silver","billing_cycle":"monthly","coupon_code":"YAZ30"}' $TOKEN)" 400
+eq "olmayan kod → 400" "$(post /api/v1/subscriptions/upgrade-quote '{"member_id":20,"plan":"gold","billing_cycle":"monthly","coupon_code":"YOK99"}' $TOKEN)" 400
+post /api/v1/subscriptions/upgrade-quote '{"member_id":20,"plan":"gold","billing_cycle":"monthly","coupon_code":"yaz30"}' $TOKEN >/dev/null
+eq "teklif: 899 − %30, yenileme de indirimli, 2 ödeme" "$(pyj "f\"{d['charge_amount']}/{d['discount_amount']}/{d['renewal_amount']}/{d['discount_cycles']}/{d['discount_source']}\"")" "629.30/269.70/629.30/2/coupon"
+eq "kuponlu ödeme başlatıldı" "$(post /api/v1/payments/init "$(gold_init 20 u20a ',"coupon_code":"yaz30"')" $TOKEN)" 200
+eq "PayTR tutarı ve sepeti indirimli" "$(pyj "d['form_params']['payment_amount']+'/'+d['discount_amount']")" "629.30/269.70"
+eq "ödeme bitmeden kullanım sayılmadı" "$(sql "SELECT redemptions FROM coupons WHERE code='YAZ30'")" 0
+eq "kuponlu callback → 200" "$(callback u20a success 62930 ut20)" 200
+SUB20=$(sql "SELECT subscription_id FROM paytr_payments WHERE merchant_oid='u20a'")
+eq "kullanım yazıldı, abonelik aktif, 1 indirimli yenileme kaldı" "$(sql "SELECT (SELECT redemptions FROM coupons WHERE code='YAZ30')||'/'||status||'/'||(metadata->'discount'->>'cycles_left') FROM paytr_subscriptions WHERE id=$SUB20")" "1/active/1"
+eq "fatura indirimli tutarla" "$(sql "SELECT total_kurus FROM invoices WHERE merchant_oid='u20a'")" 62930
+eq "kullanım sınırı dolu → 400" "$(post /api/v1/subscriptions/upgrade-quote '{"member_id":21,"plan":"gold","billing_cycle":"monthly","coupon_code":"YAZ30"}' $TOKEN)" 400
+sql "UPDATE paytr_subscriptions SET next_payment_date=$UTC - interval '1 minute', last_renewal_attempt_at=NULL WHERE id=$SUB20"
+tick
+P20=$(sql "SELECT merchant_oid FROM paytr_payments WHERE subscription_id=$SUB20 AND status='pending' ORDER BY id DESC LIMIT 1")
+eq "1. yenileme indirimli çekildi" "$(sql "SELECT amount FROM paytr_payments WHERE merchant_oid='$P20'")" "629.30"
+callback "$P20" success 62930 >/dev/null
+eq "indirim hakkı bitti" "$(sql "SELECT metadata->'discount'->>'cycles_left' FROM paytr_subscriptions WHERE id=$SUB20")" 0
+sql "UPDATE paytr_subscriptions SET next_payment_date=$UTC - interval '1 minute', last_renewal_attempt_at=NULL WHERE id=$SUB20"
+tick
+P20B=$(sql "SELECT merchant_oid FROM paytr_payments WHERE subscription_id=$SUB20 AND status='pending' ORDER BY id DESC LIMIT 1")
+eq "2. yenileme liste fiyatından" "$(sql "SELECT amount FROM paytr_payments WHERE merchant_oid='$P20B'")" "899.00"
+callback "$P20B" success 89900 >/dev/null
+eq "kupon pasifleştirilebilir" "$(post /api/v1/admin/coupons/yaz30/active '{"active":false}' $TOKEN)" 200
+get /api/v1/admin/coupons >/dev/null
+eq "kupon listesi" "$(pyj "f\"{d['items'][0]['code']}/{d['items'][0]['active']}/{d['items'][0]['redemptions']}\"")" "YAZ30/False/1"
+
+echo "== Ücretsiz deneme (kartsız 7 gün Gold)"
+get /api/v1/members/24/growth >/dev/null
+eq "deneme hakkı var" "$(pyj "d['trial']['eligible']")" True
+eq "deneme başladı" "$(post /api/v1/trials/start '{"member_id":24,"email":"k24@x.test"}' $TOKEN)" 200
+eq "müşteri Gold, durum trial, ödeme tarihi yok" "$(sql "SELECT user_type||'/'||subscription_status||'/'||coalesce(next_payment_date::text,'yok') FROM customers WHERE member_id=24")" "Gold/trial/yok"
+eq "ikinci deneme → 400" "$(post /api/v1/trials/start '{"member_id":24,"email":"k24@x.test"}' $TOKEN)" 400
+eq "abone olmuş üye deneme alamaz → 400" "$(post /api/v1/trials/start '{"member_id":20,"email":"k20@x.test"}' $TOKEN)" 400
+post /api/v1/subscriptions/upgrade-quote '{"member_id":24,"plan":"gold","billing_cycle":"monthly"}' $TOKEN >/dev/null
+eq "deneme sırasında Gold alınabilir (tam fiyat)" "$(pyj "d['charge_amount']")" "899.00"
+TRIAL24=$(sql "SELECT id FROM paytr_subscriptions WHERE member_id=24")
+sql "UPDATE paytr_subscriptions SET expires_at=$UTC + interval '1 day' WHERE id=$TRIAL24"
+tick
+eq "bitimine 48 saat kala hatırlatıldı" "$(sql "SELECT metadata->>'reminded' FROM paytr_subscriptions WHERE id=$TRIAL24")" true
+sql "UPDATE paytr_subscriptions SET expires_at=$UTC - interval '1 minute' WHERE id=$TRIAL24"
+tick
+eq "süresi dolunca ek süresiz Standard" "$(sql "SELECT s.status||'/'||c.user_type FROM paytr_subscriptions s JOIN customers c USING (member_id) WHERE s.id=$TRIAL24")" "expired/Standard"
+eq "denemede tahsilat denenmedi" "$(sql "SELECT count(*) FROM paytr_payments WHERE member_id=24")" 0
+eq "deneme bitti, hak yok" "$(get /api/v1/members/24/growth >/dev/null; pyj "d['trial']['eligible']")" False
+
+echo "== Referans (davetliye ilk ödemede %20, davet edene 14 gün sonra 1 ay)"
+get /api/v1/members/22/growth >/dev/null
+CODE22=$(pyj "d['referral']['code']")
+eq "referans kodu 8 karakter" "${#CODE22}" 8
+eq "aynı kod tekrar istenince değişmez" "$(get /api/v1/members/22/growth >/dev/null; pyj "d['referral']['code']")" "$CODE22"
+eq "kendini davet edemez" "$(post /api/v1/referrals/claim "{\"member_id\":22,\"code\":\"$CODE22\"}" $TOKEN >/dev/null; pyj "d['claimed']")" False
+eq "ödemesi olan üye davet edilemez" "$(post /api/v1/referrals/claim "{\"member_id\":20,\"code\":\"$CODE22\"}" $TOKEN >/dev/null; pyj "d['claimed']")" False
+eq "geçersiz kod sessizce yok sayılır" "$(post /api/v1/referrals/claim '{"member_id":23,"code":"ZZZZZZZZ"}' $TOKEN >/dev/null; pyj "d['claimed']")" False
+eq "davet kaydedildi (küçük harf de olur)" "$(post /api/v1/referrals/claim "{\"member_id\":23,\"code\":\"${CODE22,,}\"}" $TOKEN >/dev/null; pyj "d['claimed']")" True
+eq "davetliye %20 gösteriliyor" "$(get /api/v1/members/23/growth >/dev/null; pyj "d['referral_discount_percent']")" 20
+eq "davetli ilk ödemesi %20 indirimli" "$(post /api/v1/payments/init "$(gold_init 23 u23a)" $TOKEN >/dev/null; pyj "d['form_params']['payment_amount']")" "719.20"
+callback u23a success 71920 ut23 >/dev/null
+SUB23=$(sql "SELECT subscription_id FROM paytr_payments WHERE merchant_oid='u23a'")
+eq "ilk ödeme işaretlendi; indirim yenilemede yok" "$(sql "SELECT (first_paid_at IS NOT NULL)||'/'||(SELECT metadata->'discount'->>'cycles_left' FROM paytr_subscriptions WHERE id=$SUB23) FROM referrals WHERE referred_id=23")" "true/0"
+tick
+eq "14 gün dolmadan ödül yok" "$(sql "SELECT coalesce(reward,'yok') FROM referrals WHERE referred_id=23")" yok
+sql "UPDATE referrals SET first_paid_at = $UTC - interval '15 days' WHERE referred_id=23"
+tick
+eq "aboneliği olmayan davet edene 899 TL kredi" "$(sql "SELECT reward FROM referrals WHERE referred_id=23")/$(sql "SELECT sum(amount_kurus) FROM member_credits WHERE member_id=22")" "credit/89900"
+post /api/v1/subscriptions/upgrade-quote '{"member_id":22,"plan":"silver","billing_cycle":"monthly"}' $TOKEN >/dev/null
+eq "kredi ilk ödemeden düşülür (en az 1 TL)" "$(pyj "d['charge_amount']+'/'+d['balance_used']")" "1.00/348.00"
+SILVER22=$(echo "$INIT7" | sed 's/"member_id":7/"member_id":22/; s/u7a/u22a/; s/g@x.test/k22@x.test/')
+eq "kredili ödeme başlatıldı" "$(post /api/v1/payments/init "$SILVER22" $TOKEN >/dev/null; pyj "d['form_params']['payment_amount']")" "1.00"
+callback u22a success 100 ut22 >/dev/null
+eq "kalan kredi" "$(sql "SELECT sum(amount_kurus) FROM member_credits WHERE member_id=22")" 55100
+eq "aynı ödeme için kredi ikinci kez düşülmez" "$(callback u22a success 100 ut22 >/dev/null; sql "SELECT count(*) FROM member_credits WHERE member_id=22 AND reason='used'")" 1
+# Aboneliği olan davet eden: +1 ay uzatma
+get /api/v1/members/20/growth >/dev/null
+CODE20=$(pyj "d['referral']['code']")
+post /api/v1/referrals/claim "{\"member_id\":21,\"code\":\"$CODE20\"}" $TOKEN >/dev/null
+post /api/v1/payments/init "$(gold_init 21 u21a)" $TOKEN >/dev/null
+callback u21a success 71920 ut21 >/dev/null
+EXP20=$(sql "SELECT expires_at FROM paytr_subscriptions WHERE id=$SUB20")
+sql "UPDATE referrals SET first_paid_at = $UTC - interval '15 days' WHERE referred_id=21"
+tick
+eq "aktif aboneliği olan davet edene +1 ay" "$(sql "SELECT reward FROM referrals WHERE referred_id=21")/$(sql "SELECT expires_at = timestamp '$EXP20' + interval '1 month' FROM paytr_subscriptions WHERE id=$SUB20")" "extension/t"
+eq "müşteri kaydında bitiş de uzadı" "$(sql "SELECT c.subscription_expires_at = s.expires_at FROM customers c JOIN paytr_subscriptions s ON s.id=$SUB20 WHERE c.member_id=20")" t
+
 echo "== Sonuç: $PASS geçti, $FAIL başarısız"
 [ "$FAIL" = 0 ]

@@ -4,7 +4,7 @@ use crate::{
     billing,
     crypto::{generate_card_list_token, verify_callback_hash},
     db::{
-        billing_repo, card_repo, customer_repo,
+        billing_repo, card_repo, customer_repo, growth_repo,
         models::{PaytrPaymentRecord, PaytrSubscription},
         payment_repo, subscription_repo,
     },
@@ -371,6 +371,26 @@ pub(crate) async fn handle_success(state: &crate::AppData, payload: &CallbackPay
     )
     .await
     .map_err(anyhow::Error::from)?;
+
+    // İndirim/kredi/referans: ödeme başarılı olunca yazılır (init'te değil — yarım kalan ödeme
+    // kuponu tüketmesin).
+    let meta = sub.metadata.as_ref();
+    let discount = meta
+        .and_then(|m| m.get("discount"))
+        .and_then(|d| serde_json::from_value::<crate::pricing::Discount>(d.clone()).ok());
+    if is_first_payment {
+        if let Some(code) = discount.as_ref().filter(|d| d.source == "coupon").and_then(|d| d.code.as_deref()) {
+            let off = meta.and_then(|m| m.get("discount_kurus")).and_then(|v| v.as_i64()).unwrap_or(0);
+            growth_repo::record_redemption(&mut tx, code, member_id, subscription_id, &payload.merchant_oid, off).await?;
+        }
+        let used = meta.and_then(|m| m.get("credit_used_kurus")).and_then(|v| v.as_i64()).unwrap_or(0);
+        if used > 0 {
+            growth_repo::add_credit(&mut *tx, member_id, -used, "used", &payload.merchant_oid).await?;
+        }
+        growth_repo::mark_referral_paid(&mut *tx, member_id, &payload.merchant_oid).await?;
+    } else if let Some(d) = discount.filter(|d| d.cycles_left.is_some_and(|n| n > 0)) {
+        subscription_repo::set_discount(&mut *tx, subscription_id, &d.after_renewal()).await?;
+    }
 
     let is_upgrade = is_first_payment && sub.metadata.as_ref().is_some_and(|m| m.get("upgrade_from").is_some());
     let subject = if is_upgrade {

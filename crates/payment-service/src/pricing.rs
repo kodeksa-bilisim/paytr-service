@@ -133,9 +133,76 @@ pub fn unused_credit_kurus(period_kurus: i64, billing_cycle: &str, expires_at: N
     (period_kurus as i128 * remaining as i128 / total as i128) as i64
 }
 
+/// Referans linkiyle gelen üyenin ilk ödemesindeki indirim (%).
+pub const REFERRAL_DISCOUNT_PCT: i64 = 20;
+/// Referans ödülü kredisi: bir aylık Gold (kuruş).
+pub const REFERRAL_CREDIT_KURUS: i64 = 89_900;
+
+/// Kupon ya da referans indirimi. Abonelik metadata'sında `discount` olarak saklanır; yenilemede
+/// `cycles_left` > 0 (ya da süresiz: None) oldukça uygulanır.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Discount {
+    /// "coupon" | "referral"
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_kurus: Option<i64>,
+    /// İlk ödemeden SONRAKİ kaç yenilemede daha geçerli (None = süresiz).
+    pub cycles_left: Option<i64>,
+}
+
+impl Discount {
+    /// Bu tutardan düşülecek indirim (kuruş). Tahsilat en az `MIN_CHARGE_KURUS` kalır.
+    pub fn amount_off(&self, kurus: i64) -> i64 {
+        let raw = match (self.percent, self.fixed_kurus) {
+            (Some(p), _) => kurus * p.clamp(0, 100) / 100,
+            (None, Some(f)) => f.max(0),
+            _ => 0,
+        };
+        raw.min((kurus - MIN_CHARGE_KURUS).max(0))
+    }
+
+    /// Yenilemede hâlâ geçerli mi?
+    pub fn applies_to_renewal(&self) -> bool {
+        self.cycles_left.map_or(true, |n| n > 0)
+    }
+
+    /// Başarılı yenilemeden sonraki hâli.
+    pub fn after_renewal(&self) -> Discount {
+        Discount { cycles_left: self.cycles_left.map(|n| (n - 1).max(0)), ..self.clone() }
+    }
+}
+
+/// Kupon kodunu normalleştirir (büyük harf, boşluksuz); biçim dışıysa None.
+pub fn normalize_coupon_code(raw: &str) -> Option<String> {
+    let c = raw.trim().to_uppercase();
+    (c.len() >= 3 && c.len() <= 40 && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')).then_some(c)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discounts() {
+        let pct = Discount { source: "coupon".into(), code: Some("X".into()), percent: Some(30), fixed_kurus: None, cycles_left: Some(2) };
+        assert_eq!(pct.amount_off(89_900), 26_970);
+        let fixed = Discount { percent: None, fixed_kurus: Some(100_000), ..pct.clone() };
+        // Sabit indirim tutarı aşamaz; en az MIN_CHARGE kalır.
+        assert_eq!(fixed.amount_off(34_900), 34_900 - MIN_CHARGE_KURUS);
+        assert!(pct.applies_to_renewal());
+        let once = pct.after_renewal().after_renewal();
+        assert_eq!(once.cycles_left, Some(0));
+        assert!(!once.applies_to_renewal());
+        let forever = Discount { cycles_left: None, ..pct };
+        assert!(forever.after_renewal().applies_to_renewal());
+        assert_eq!(normalize_coupon_code(" yaz30 ").as_deref(), Some("YAZ30"));
+        assert_eq!(normalize_coupon_code("a b"), None);
+        assert_eq!(normalize_coupon_code("ab"), None);
+    }
 
     fn at(y: i32, m: u32, d: u32) -> NaiveDateTime {
         chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(0, 0, 0).unwrap()

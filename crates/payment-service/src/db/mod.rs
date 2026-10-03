@@ -2,6 +2,7 @@ pub mod admin_repo;
 pub mod billing_repo;
 pub mod card_repo;
 pub mod customer_repo;
+pub mod growth_repo;
 pub mod models;
 pub mod payment_repo;
 pub mod subscription_repo;

@@ -33,6 +33,9 @@ pub struct InitPaymentRequest {
     #[serde(default = "default_lang")]
     pub client_lang: String,
     pub debug_on: Option<u8>,
+    /// İndirim kodu (isteğe bağlı).
+    #[serde(default)]
+    pub coupon_code: Option<String>,
 }
 
 /// Enterprise plan için fiyat hesaplayıcı isteği — fiyat backend'de hesaplanır.
@@ -55,6 +58,8 @@ pub struct EnterpriseInitRequest {
     pub client_lang: String,
     pub card_type: Option<String>,
     pub debug_on: Option<u8>,
+    #[serde(default)]
+    pub coupon_code: Option<String>,
 }
 
 /// Downgrade planlaması — ödeme alınmaz, dönem sonunda plan değişir.
@@ -81,9 +86,12 @@ pub struct UpgradeQuoteRequest {
     pub users: Option<i32>,
     pub extra_links: Option<i32>,
     pub extra_clicks: Option<i32>,
+    #[serde(default)]
+    pub coupon_code: Option<String>,
 }
 
 /// Tutarlar TL ("724.50"). Geçerli abonelik yoksa kredi 0 ve `from_*` alanları boş.
+/// `charge_amount` = liste − kalan süre kredisi − indirim − kredi bakiyesi (tahsil edilecek).
 #[derive(Debug, Serialize)]
 pub struct UpgradeQuoteResponse {
     pub list_amount: String,
@@ -91,6 +99,17 @@ pub struct UpgradeQuoteResponse {
     pub charge_amount: String,
     pub from_plan: Option<String>,
     pub from_expires_at: Option<String>,
+    /// İndirim (kupon ya da referans) tutarı.
+    pub discount_amount: String,
+    /// "coupon" | "referral"
+    pub discount_source: Option<String>,
+    pub coupon_code: Option<String>,
+    /// Kaç ödemede geçerli: null = süresiz, 1 = yalnızca bu ödeme.
+    pub discount_cycles: Option<i64>,
+    /// Kredi bakiyesinden düşülen.
+    pub balance_used: String,
+    /// Sonraki yenilemede çekilecek tutar.
+    pub renewal_amount: String,
 }
 
 /// Downgrade planlama yanıtı.
@@ -122,6 +141,8 @@ pub struct InitPaymentResponse {
     /// yükseltmede liste fiyatından `credit_amount` düşülmüş hâli.
     pub list_amount: String,
     pub credit_amount: String,
+    /// İndirim + kredi bakiyesinden düşülen toplam.
+    pub discount_amount: String,
     pub form_params: PaytrFormParams,
 }
 

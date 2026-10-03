@@ -123,6 +123,45 @@ pub async fn set_subscription_expired(pool: &PgPool, member_id: i32, subscriptio
     Ok(r.rows_affected() > 0)
 }
 
+/// Ücretsiz deneme başladı: plan açılır, `subscription_status = 'trial'`, ödeme tarihi yok.
+pub async fn set_trial<'e>(ex: impl PgExecutor<'e>, member_id: i32, plan: &str, subscription_id: i32, expires_at: NaiveDateTime) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE customers
+        SET subscription_status = 'trial', subscription_plan = $2, subscription_id = $3::text,
+            subscription_expires_at = $4, next_payment_date = NULL, user_type = $5,
+            custom_plan = NULL, scheduled_plan = NULL
+        WHERE member_id = $1
+        "#,
+    )
+    .bind(member_id)
+    .bind(plan)
+    .bind(subscription_id)
+    .bind(expires_at)
+    .bind(plan_to_user_type(plan))
+    .execute(ex)
+    .await?;
+    Ok(())
+}
+
+/// Referans ödülü uzatması: güncel abonelikse bitiş ve sonraki ödeme tarihi müşteri kaydına da yazılır.
+pub async fn sync_extended<'e>(ex: impl PgExecutor<'e>, member_id: i32, subscription_id: i32, expires_at: NaiveDateTime) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE customers
+        SET subscription_expires_at = $3,
+            next_payment_date = CASE WHEN next_payment_date IS NULL THEN NULL ELSE next_payment_date + INTERVAL '1 month' END
+        WHERE member_id = $1 AND subscription_id = $2::text
+        "#,
+    )
+    .bind(member_id)
+    .bind(subscription_id)
+    .bind(expires_at)
+    .execute(ex)
+    .await?;
+    Ok(())
+}
+
 /// Downgrade planlanmış olarak işaretler (dönem sonunda geçiş).
 pub async fn set_scheduled_plan(pool: &PgPool, member_id: i32, plan: &str) -> Result<()> {
     sqlx::query("UPDATE customers SET scheduled_plan = $1 WHERE member_id = $2")

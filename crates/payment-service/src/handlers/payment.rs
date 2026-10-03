@@ -133,13 +133,32 @@ async fn compute_charge(state: &crate::AppData, member_id: i32, target_plan: &st
     Ok(Charge { list_kurus, credit_kurus, charge_kurus, from: Some((cur.id, cur.plan, cur.expires_at)) })
 }
 
-/// Yükseltmede sepet tek kalem: tahsil edilen fark tutarı (PayTR sepeti tutarla uyuşmalı).
-fn upgrade_basket(label: &str, charge: &Charge) -> Vec<BasketItem> {
-    vec![BasketItem {
-        name: format!("{label} - yükseltme (kalan süre düşüldü)"),
-        price: format_tl(charge.charge_kurus),
-        quantity: 1,
-    }]
+/// Liste fiyatından farklı tahsilatta (yükseltme, indirim, kredi) sepet tek kalem: tahsil
+/// edilen tutar (PayTR sepeti tutarla uyuşmalı).
+fn adjusted_basket(label: &str, charge: &Charge, adj: &crate::growth::Adjusted) -> Vec<BasketItem> {
+    let mut notes = Vec::new();
+    if charge.from.is_some() {
+        notes.push("yükseltme, kalan süre düşüldü");
+    }
+    if adj.discount_kurus > 0 {
+        notes.push("indirimli");
+    }
+    if adj.credit_used_kurus > 0 {
+        notes.push("bakiye kullanıldı");
+    }
+    vec![BasketItem { name: format!("{label} ({})", notes.join(", ")), price: format_tl(adj.final_kurus), quantity: 1 }]
+}
+
+/// Abonelik metadata'sı: yükseltme bilgisi + indirim/kredi.
+fn subscription_metadata(base: Option<serde_json::Value>, adj: &crate::growth::Adjusted) -> Option<serde_json::Value> {
+    let mut m = match base {
+        Some(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    if let Some(extra) = adj.metadata() {
+        m.extend(extra);
+    }
+    (!m.is_empty()).then_some(serde_json::Value::Object(m))
 }
 
 /// PayTR `debug_on` yalnızca test modunda iletilir (canlıda hata ayrıntısı kullanıcıya gösterilmesin).
@@ -168,12 +187,20 @@ pub async fn upgrade_quote(
             .ok_or_else(|| AppError::BadRequest(format!("Geçersiz plan ya da dönem: {} / {}", req.plan, req.billing_cycle)))?
     };
     let c = compute_charge(&state, req.member_id, &req.plan, list_kurus).await?;
+    let adj = crate::growth::adjust(&state, req.member_id, &req.plan, &req.billing_cycle, req.coupon_code.as_deref(), c.charge_kurus).await?;
+    let renewal_kurus = list_kurus - adj.discount.as_ref().filter(|d| d.applies_to_renewal()).map_or(0, |d| d.amount_off(list_kurus));
     Ok(Json(UpgradeQuoteResponse {
         list_amount: format_tl(c.list_kurus),
         credit_amount: format_tl(c.credit_kurus),
-        charge_amount: format_tl(c.charge_kurus),
+        charge_amount: format_tl(adj.final_kurus),
         from_plan: c.from.as_ref().map(|(_, p, _)| p.clone()),
         from_expires_at: c.from.as_ref().and_then(|(_, _, e)| e.map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string())),
+        discount_amount: format_tl(adj.discount_kurus),
+        discount_source: adj.discount.as_ref().map(|d| d.source.clone()),
+        coupon_code: adj.discount.as_ref().and_then(|d| d.code.clone()),
+        discount_cycles: adj.discount.as_ref().and_then(|d| d.cycles_left.map(|n| n + 1)),
+        balance_used: format_tl(adj.credit_used_kurus),
+        renewal_amount: format_tl(renewal_kurus),
     }))
 }
 
@@ -193,10 +220,11 @@ pub async fn init_payment(
     // Aynı ya da daha düşük plan yeni ödemeyle alınamaz (düşük plana geçiş schedule-downgrade
     // ile); üst plana geçişte eski dönemin kalan değeri düşülür.
     let charge = compute_charge(&state, member_id, &req.plan, list_kurus).await?;
-    let charge_amount = format_tl(charge.charge_kurus);
+    let adj = crate::growth::adjust(&state, member_id, &req.plan, &req.billing_cycle, req.coupon_code.as_deref(), charge.charge_kurus).await?;
+    let charge_amount = format_tl(adj.final_kurus);
 
-    let basket_items = if charge.from.is_some() {
-        upgrade_basket(&format!("{} Plan", crate::email_templates::plan_label(&req.plan)), &charge)
+    let basket_items = if adj.final_kurus != charge.list_kurus {
+        adjusted_basket(&format!("{} Plan", crate::email_templates::plan_label(&req.plan)), &charge, &adj)
     } else {
         req.user_basket
     };
@@ -223,7 +251,7 @@ pub async fn init_payment(
         &req.currency,
         &req.user_phone,
         &req.email,
-        charge.metadata(),
+        subscription_metadata(charge.metadata(), &adj),
     )
     .await
     .map_err(anyhow::Error::from)?;
@@ -284,6 +312,7 @@ pub async fn init_payment(
             paytr_endpoint: paytr_client::payment_endpoint(),
             list_amount: format_tl(charge.list_kurus),
             credit_amount: format_tl(charge.credit_kurus),
+            discount_amount: format_tl(adj.discount_kurus + adj.credit_used_kurus),
             form_params: PaytrFormParams {
                 merchant_id: state.config.merchant_id.clone(),
                 paytr_token,
@@ -331,7 +360,8 @@ pub async fn init_enterprise_payment(
 
     // Enterprise zaten geçerliyse yeni ödeme alınmaz; alt plandan geçişte kalan değer düşülür.
     let charge = compute_charge(&state, member_id, "enterprise", list_kurus).await?;
-    let charge_amount = format_tl(charge.charge_kurus);
+    let adj = crate::growth::adjust(&state, member_id, "enterprise", &req.billing_cycle, req.coupon_code.as_deref(), charge.charge_kurus).await?;
+    let charge_amount = format_tl(adj.final_kurus);
 
     let basket_label = format!(
         "Enterprise Plan{} ({} kullanıcı, {}k link/ay, {}k tıklama/ay)",
@@ -340,8 +370,8 @@ pub async fn init_enterprise_payment(
         10 + req.extra_links,
         100 + req.extra_clicks * 10,
     );
-    let basket_items = if charge.from.is_some() {
-        upgrade_basket(&basket_label, &charge)
+    let basket_items = if adj.final_kurus != charge.list_kurus {
+        adjusted_basket(&basket_label, &charge, &adj)
     } else {
         vec![BasketItem { name: basket_label, price: charge_amount.clone(), quantity: 1 }]
     };
@@ -356,6 +386,7 @@ pub async fn init_enterprise_payment(
     if let (Some(serde_json::Value::Object(up)), Some(m)) = (charge.metadata(), metadata.as_object_mut()) {
         m.extend(up);
     }
+    let metadata = subscription_metadata(Some(metadata), &adj).unwrap_or_default();
 
     // Eski pending'in iptali ve yeni kayıtlar tek transaction'da, üye kilidi altında.
     let mut tx = state.db.begin().await.map_err(anyhow::Error::from)?;
@@ -434,6 +465,7 @@ pub async fn init_enterprise_payment(
             paytr_endpoint: paytr_client::payment_endpoint(),
             list_amount,
             credit_amount: format_tl(charge.credit_kurus),
+            discount_amount: format_tl(adj.discount_kurus + adj.credit_used_kurus),
             form_params: PaytrFormParams {
                 merchant_id: state.config.merchant_id.clone(),
                 paytr_token,
@@ -618,8 +650,23 @@ mod tests {
         let m = c.metadata().unwrap();
         assert_eq!(m["upgrade_from"], 7);
         assert_eq!(m["credit_amount"], "174.50");
-        assert_eq!(upgrade_basket("Gold Plan", &c)[0].price, "724.50");
+        let adj = crate::growth::Adjusted { discount: None, discount_kurus: 0, credit_used_kurus: 0, final_kurus: c.charge_kurus };
+        let basket = adjusted_basket("Gold Plan", &c, &adj);
+        assert_eq!(basket[0].price, "724.50");
+        assert_eq!(basket[0].name, "Gold Plan (yükseltme, kalan süre düşüldü)");
         let fresh = Charge { list_kurus: 89_900, credit_kurus: 0, charge_kurus: 89_900, from: None };
         assert!(fresh.metadata().is_none());
+    }
+
+    #[test]
+    fn discount_goes_into_subscription_metadata() {
+        let d = crate::growth::referral_discount();
+        let adj = crate::growth::Adjusted { discount: Some(d.clone()), discount_kurus: 17_980, credit_used_kurus: 500, final_kurus: 71_420 };
+        let m = subscription_metadata(Some(serde_json::json!({ "users": 3 })), &adj).unwrap();
+        assert_eq!(m["users"], 3);
+        assert_eq!(m["discount_kurus"], 17_980);
+        assert_eq!(m["credit_used_kurus"], 500);
+        assert_eq!(serde_json::from_value::<crate::pricing::Discount>(m["discount"].clone()).unwrap(), d);
+        assert!(subscription_metadata(None, &crate::growth::Adjusted::default()).is_none());
     }
 }

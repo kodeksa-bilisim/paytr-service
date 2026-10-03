@@ -539,6 +539,60 @@ pub fn payment_review_alert(reason: &str, details: Vec<(&str, String)>, site_url
     })
 }
 
+/// Ücretsiz deneme bitmek üzere (bitişten ~2 gün önce).
+pub fn trial_ending(name: Option<&str>, plan: &str, ends_at: chrono::NaiveDateTime, site_url: &str) -> EmailContent {
+    let plan_l = plan_label(plan);
+    let date = format_date_tr(ends_at);
+    let preheader = format!("{plan_l} denemeniz {date} tarihinde bitiyor.");
+    render(&Layout {
+        subject: "Ücretsiz denemeniz bitmek üzere",
+        preheader: &preheader,
+        eyebrow: "Ücretsiz Deneme",
+        heading: "Denemeniz bitmek üzere",
+        greeting: greeting(name),
+        paragraphs: vec![
+            format!(
+                "<strong>{}</strong> ücretsiz denemeniz <strong>{}</strong> tarihinde sona eriyor. Kartınız kayıtlı olmadığı için hiçbir ücret alınmayacak.",
+                esc(&plan_l),
+                esc(&date)
+            ),
+            "Deneme bitince hesabınız ücretsiz plana geçer; linkleriniz çalışmaya devam eder. Özellikleri kullanmaya devam etmek için dilediğiniz zaman abone olabilirsiniz.".to_string(),
+        ],
+        features: vec![],
+        details: vec![("Plan", plan_l.clone()), ("Deneme bitişi", date.clone())],
+        cta: Some(("Planları İncele", plans_url(site_url))),
+        note: None,
+        site_url,
+    })
+}
+
+/// Referans ödülü: davet edilen kişi abone oldu.
+pub fn referral_reward(name: Option<&str>, extended_until: Option<chrono::NaiveDateTime>, credit_tl: &str, site_url: &str) -> EmailContent {
+    let (lead, detail) = match extended_until {
+        Some(until) => (
+            "Aboneliğiniz bir ay uzatıldı; bu dönem için ek ücret alınmayacak.".to_string(),
+            ("Yeni bitiş", format_date_tr(until)),
+        ),
+        None => (
+            format!("Hesabınıza <strong>{}</strong> kredi tanımlandı; bir sonraki abonelik ödemenizden otomatik düşülecek.", esc(&format_tl(credit_tl))),
+            ("Kredi", format_tl(credit_tl)),
+        ),
+    };
+    render(&Layout {
+        subject: "Davetiniz için 1 ay hediye",
+        preheader: "Davet ettiğiniz kişi nlink.tr'ye abone oldu.",
+        eyebrow: "Referans Programı",
+        heading: "Teşekkürler, 1 ay sizden",
+        greeting: greeting(name),
+        paragraphs: vec!["Davet bağlantınızla gelen bir kullanıcı nlink.tr'ye abone oldu.".to_string(), lead],
+        features: vec![],
+        details: vec![detail],
+        cta: Some(("Davet Bağlantım", format!("{}/tr/app/settings", site_url.trim_end_matches('/')))),
+        note: Some("Yılda en fazla 12 ay hediye kazanabilirsiniz.".to_string()),
+        site_url,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

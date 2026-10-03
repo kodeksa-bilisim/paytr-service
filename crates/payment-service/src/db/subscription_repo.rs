@@ -139,12 +139,14 @@ pub async fn find_active(pool: &PgPool, member_id: i32) -> Result<Option<PaytrSu
 
 /// Üyenin hâlâ geçerli aboneliği (aktif ya da süresi dolmamış iptal; birden fazlaysa en yenisi).
 /// Yükseltme fark ücreti ve "bu plan zaten var" kontrolü bunun üzerinden yapılır.
+/// Ücretsiz deneme sayılmaz: deneme sırasında satın alma normal ilk ödemedir (deneme `replaced` olur).
 pub async fn find_live(pool: &PgPool, member_id: i32) -> Result<Option<PaytrSubscription>> {
     let sub = sqlx::query_as::<_, PaytrSubscription>(
         r#"
         SELECT * FROM paytr_subscriptions
         WHERE member_id = $1 AND started_at IS NOT NULL
           AND (status = 'active' OR (status = 'cancelled' AND expires_at > NOW()))
+          AND NOT COALESCE((metadata->>'trial')::boolean, false)
         ORDER BY id DESC LIMIT 1
         "#,
     )
@@ -165,6 +167,7 @@ pub async fn live_others_for_update<'e>(
         SELECT * FROM paytr_subscriptions
         WHERE member_id = $1 AND id <> $2 AND started_at IS NOT NULL
           AND (status = 'active' OR (status = 'cancelled' AND expires_at > NOW()))
+          AND NOT COALESCE((metadata->>'trial')::boolean, false)
         FOR UPDATE
         "#,
     )
@@ -282,6 +285,8 @@ pub struct DueSubscription {
     pub user_phone: String,
     pub user_email: String,
     pub original_plan: String,  // Asıl plan (scheduled_plan'ın set edilip edilmediğini anlamak için)
+    /// İndirim (`discount`) yenilemede uygulanır.
+    pub metadata: Option<serde_json::Value>,
 }
 
 pub async fn query_due(pool: &PgPool, max_failed_attempts: i32) -> Result<Vec<DueSubscription>> {
@@ -299,7 +304,8 @@ pub async fn query_due(pool: &PgPool, max_failed_attempts: i32) -> Result<Vec<Du
             c.require_cvv,
             COALESCE(s.user_phone, '')                                  AS user_phone,
             COALESCE(s.user_email, cu.email, '')                       AS user_email,
-            s.plan                                                      AS original_plan
+            s.plan                                                      AS original_plan,
+            s.metadata
         FROM paytr_subscriptions s
         JOIN paytr_cards c
             ON c.ctoken = s.ctoken AND c.is_active = TRUE
@@ -352,6 +358,7 @@ pub async fn mark_renewal_attempt(pool: &PgPool, subscription_id: i32) -> Result
 /// - `cancelled`: expires_at geçince.
 /// - `active`: ancak expires_at + `grace_days` geçince (yenileme denemeleri için süre) ve
 ///   bekleyen bir ödemesi yoksa.
+/// - Ücretsiz deneme: expires_at geçince (ek süre yok, tahsilat denenmez).
 pub async fn mark_expired(pool: &PgPool, grace_days: i32) -> Result<Vec<(i32, i32)>> {
     let rows: Vec<(i32, i32)> = sqlx::query_as(
         r#"
@@ -360,6 +367,7 @@ pub async fn mark_expired(pool: &PgPool, grace_days: i32) -> Result<Vec<(i32, i3
         WHERE (
                 (s.status = 'cancelled' AND s.expires_at < NOW())
              OR (s.status = 'active'    AND s.expires_at < NOW() - make_interval(days => $1))
+             OR (s.status = 'active'    AND s.expires_at < NOW() AND COALESCE((s.metadata->>'trial')::boolean, false))
               )
           AND NOT EXISTS (
                 SELECT 1 FROM paytr_payments p
@@ -416,6 +424,106 @@ pub async fn cancel_scheduled(pool: &PgPool, subscription_id: i32) -> Result<()>
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Yenilemeden sonra indirimin kalan dönem sayısını yazar.
+pub async fn set_discount<'e>(ex: impl PgExecutor<'e>, id: i32, discount: &crate::pricing::Discount) -> Result<()> {
+    sqlx::query(
+        "UPDATE paytr_subscriptions
+         SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{discount}', $2), updated_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(serde_json::to_value(discount)?)
+    .execute(ex)
+    .await?;
+    Ok(())
+}
+
+/// Ücretsiz deneme: kartsız, tutarsız aktif abonelik (`metadata.trial`). Yenilenmez
+/// (`next_payment_date` NULL, kart yok); süresi dolunca ek süresiz biter.
+pub async fn create_trial<'e>(
+    ex: impl PgExecutor<'e>,
+    member_id: i32,
+    plan: &str,
+    list_amount: &str,
+    email: &str,
+    started_at: NaiveDateTime,
+    expires_at: NaiveDateTime,
+) -> Result<i32> {
+    Ok(sqlx::query_scalar(
+        r#"
+        INSERT INTO paytr_subscriptions
+            (member_id, plan, status, billing_cycle, amount, currency, started_at, expires_at, user_email, metadata)
+        VALUES ($1, $2, 'active', 'monthly', $3, 'TL', $4, $5, $6, '{"trial": true}'::jsonb)
+        RETURNING id
+        "#,
+    )
+    .bind(member_id)
+    .bind(plan)
+    .bind(list_amount)
+    .bind(started_at)
+    .bind(expires_at)
+    .bind(email)
+    .fetch_one(ex)
+    .await?)
+}
+
+/// Deneme hakkı: hiç başlamış (ödemeli ya da deneme) aboneliği olmayan üye.
+pub async fn trial_eligible(pool: &PgPool, member_id: i32) -> Result<bool> {
+    Ok(sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM paytr_subscriptions WHERE member_id = $1 AND started_at IS NOT NULL)")
+        .bind(member_id)
+        .fetch_one(pool)
+        .await?)
+}
+
+/// Bitimine `within_hours` kalmış, henüz hatırlatılmamış aktif denemeler: (id, üye, e-posta, bitiş).
+pub async fn trials_ending(pool: &PgPool, within_hours: i32) -> Result<Vec<(i32, i32, String, NaiveDateTime)>> {
+    Ok(sqlx::query_as(
+        r#"
+        SELECT s.id, s.member_id, COALESCE(s.user_email, c.email, ''), s.expires_at
+        FROM paytr_subscriptions s JOIN customers c ON c.member_id = s.member_id
+        WHERE s.status = 'active' AND COALESCE((s.metadata->>'trial')::boolean, false)
+          AND NOT COALESCE((s.metadata->>'reminded')::boolean, false)
+          AND s.expires_at < NOW() + make_interval(hours => $1)
+          AND s.expires_at > NOW()
+        "#,
+    )
+    .bind(within_hours)
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn mark_trial_reminded(pool: &PgPool, id: i32) -> Result<()> {
+    sqlx::query("UPDATE paytr_subscriptions SET metadata = COALESCE(metadata, '{}'::jsonb) || '{\"reminded\": true}'::jsonb WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Referans ödülü: geçerli ücretli aboneliği (deneme değil, aktif ya da iptal edilmiş ama süresi
+/// dolmamış) +1 ay uzatır. Uzatıldıysa yeni bitiş.
+pub async fn extend_one_month<'e>(ex: impl PgExecutor<'e>, member_id: i32) -> Result<Option<(i32, NaiveDateTime)>> {
+    Ok(sqlx::query_as(
+        r#"
+        UPDATE paytr_subscriptions
+        SET expires_at = expires_at + INTERVAL '1 month',
+            next_payment_date = CASE WHEN next_payment_date IS NULL THEN NULL ELSE next_payment_date + INTERVAL '1 month' END,
+            updated_at = NOW()
+        WHERE id = (
+            SELECT id FROM paytr_subscriptions
+            WHERE member_id = $1 AND started_at IS NOT NULL AND expires_at > NOW()
+              AND status IN ('active', 'cancelled')
+              AND NOT COALESCE((metadata->>'trial')::boolean, false)
+            ORDER BY id DESC LIMIT 1
+        )
+        RETURNING id, expires_at
+        "#,
+    )
+    .bind(member_id)
+    .fetch_optional(ex)
+    .await?)
 }
 
 /// Upgrade: yeni abonelik aktifleşince üyenin diğer aktif/iptal edilmiş aboneliklerini

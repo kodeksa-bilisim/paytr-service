@@ -6,6 +6,7 @@ mod db;
 mod email;
 mod email_templates;
 mod error;
+mod growth;
 mod handlers;
 mod models;
 mod paytr_client;
@@ -128,6 +129,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/members/:member_id/stop-renewal", post(handlers::member::stop_renewal))
         .route("/api/v1/members/:member_id/erase", post(handlers::member::erase))
         .route("/api/v1/members/:member_id/export", get(handlers::member::export))
+        // Büyüme: deneme, referans, kupon
+        .route("/api/v1/members/:member_id/growth", get(handlers::growth::summary))
+        .route("/api/v1/trials/start", post(handlers::growth::start_trial))
+        .route("/api/v1/referrals/claim", post(handlers::growth::claim_referral))
+        .route("/api/v1/admin/coupons", get(handlers::growth::list_coupons).post(handlers::growth::create_coupon))
+        .route("/api/v1/admin/coupons/:code/active", post(handlers::growth::set_coupon_active))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&state), require_internal_token));
 
     let app = Router::new()

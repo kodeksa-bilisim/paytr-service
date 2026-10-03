@@ -193,6 +193,7 @@ pub async fn problem_subscriptions(pool: &PgPool) -> Result<Vec<ProblemSubscript
         LEFT JOIN customers cu ON cu.member_id = s.member_id
         LEFT JOIN paytr_cards c ON c.ctoken = s.ctoken AND c.is_active = TRUE
         WHERE s.status = 'active'
+          AND NOT COALESCE((s.metadata->>'trial')::boolean, false)
           AND (   s.expires_at < NOW()
                OR s.renewal_attempts > 0
                OR (s.next_payment_date < NOW() + INTERVAL '7 days'
