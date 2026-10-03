@@ -344,9 +344,12 @@ pub(crate) async fn handle_success(state: &crate::AppData, payload: &CallbackPay
         sub.metadata.as_ref().and_then(|m| {
             let extra_links = m.get("extra_links")?.as_i64()?;
             let extra_clicks = m.get("extra_clicks")?.as_i64()?;
+            // Ekip koltuğu (sahip dahil); qurlbackend davet sınırında kullanır.
+            let users = m.get("users").and_then(|v| v.as_i64()).unwrap_or(1).max(1);
             Some(serde_json::json!({
                 "links_limit": 10000 + extra_links * 1000,
                 "clicks_limit": 100000 + extra_clicks * 10000,
+                "users_limit": users,
             }).to_string())
         })
     } else {
