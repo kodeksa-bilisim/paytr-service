@@ -454,5 +454,40 @@ tick
 eq "aktif aboneliği olan davet edene +1 ay" "$(sql "SELECT reward FROM referrals WHERE referred_id=21")/$(sql "SELECT expires_at = timestamp '$EXP20' + interval '1 month' FROM paytr_subscriptions WHERE id=$SUB20")" "extension/t"
 eq "müşteri kaydında bitiş de uzadı" "$(sql "SELECT c.subscription_expires_at = s.expires_at FROM customers c JOIN paytr_subscriptions s ON s.id=$SUB20 WHERE c.member_id=20")" t
 
+echo "== Yönetici üye işlemleri (plan atama, sınırlar, deneme, iz kaydı)"
+sql "INSERT INTO customers (member_id,name,email,user_type) VALUES (30,'Y30','y30@x.test','Standard');"
+ACT='"actor_id":1,"actor_email":"admin@x.test"'
+UNTIL=$(date -u -d '+10 days' +%F)
+eq "yönetici uçları token'sız → 401" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/v1/admin/members/30")" 401
+eq "üye özeti → 200" "$(get /api/v1/admin/members/30)" 200
+eq "özet: plan + deneme hakkı" "$(pyj "f\"{d['plan']['user_type']}/{d['trial_eligible']}/{d['live_paid_subscription_id']}\"")" "Standard/True/None"
+eq "geçersiz plan → 400" "$(post /api/v1/admin/members/30/plan "{$ACT,\"mode\":\"grant\",\"plan\":\"platinum\",\"until\":\"$UNTIL\"}" $TOKEN)" 400
+eq "geçmiş tarih → 400" "$(post /api/v1/admin/members/30/plan "{$ACT,\"mode\":\"grant\",\"plan\":\"gold\",\"until\":\"2020-01-01\"}" $TOKEN)" 400
+eq "Enterprise ata (3 koltuk) → 200" "$(post /api/v1/admin/members/30/plan "{$ACT,\"mode\":\"grant\",\"plan\":\"enterprise\",\"until\":\"$UNTIL\",\"users\":3,\"note\":\"pilot\"}" $TOKEN)" 200
+eq "müşteri Enterprise, koltuk 3, durum trial" "$(sql "SELECT user_type||'/'||subscription_status||'/'||(custom_plan::json->>'users_limit') FROM customers WHERE member_id=30")" "Enterprise/trial/3"
+eq "atanan plan tutarsız ve manual" "$(sql "SELECT amount||'/'||(metadata->>'manual')||'/'||(metadata->>'trial') FROM paytr_subscriptions WHERE member_id=30 AND status='active'")" "0.00/true/true"
+eq "sınır: koltuk 5 → 200" "$(post /api/v1/admin/members/30/plan "{$ACT,\"mode\":\"limits\",\"users\":5}" $TOKEN)" 200
+eq "koltuk 5, link sınırı korunur" "$(sql "SELECT (custom_plan::json->>'users_limit')||'/'||(custom_plan::json->>'links_limit') FROM customers WHERE member_id=30")" "5/10000"
+eq "sınır: koltuk 0 → 400" "$(post /api/v1/admin/members/30/plan "{$ACT,\"mode\":\"limits\",\"users\":0}" $TOKEN)" 400
+eq "Gold'a geçir (önceki atama biter) → 200" "$(post /api/v1/admin/members/30/plan "{$ACT,\"mode\":\"grant\",\"plan\":\"gold\",\"until\":\"$UNTIL\"}" $TOKEN)" 200
+eq "tek aktif atama, custom_plan boş" "$(sql "SELECT count(*) FILTER (WHERE status='active')||'/'||(SELECT coalesce(custom_plan,'yok') FROM customers WHERE member_id=30) FROM paytr_subscriptions WHERE member_id=30")" "1/yok"
+eq "Gold'da sınır değiştirilemez → 400" "$(post /api/v1/admin/members/30/plan "{$ACT,\"mode\":\"limits\",\"users\":2}" $TOKEN)" 400
+eq "atanmış plan sırasında satın alma ilk ödeme (tam fiyat)" "$(post /api/v1/subscriptions/upgrade-quote '{"member_id":30,"plan":"gold","billing_cycle":"monthly"}' $TOKEN >/dev/null; pyj "d['charge_amount']")" "899.00"
+eq "geri al → 200" "$(post /api/v1/admin/members/30/plan "{$ACT,\"mode\":\"revoke\"}" $TOKEN)" 200
+eq "geri alınınca Standard" "$(sql "SELECT user_type||'/'||subscription_status FROM customers WHERE member_id=30")" "Standard/expired"
+eq "geri alınacak yok → 400" "$(post /api/v1/admin/members/30/plan "{$ACT,\"mode\":\"revoke\"}" $TOKEN)" 400
+eq "ücretli aboneliği olana plan atanmaz → 400" "$(post /api/v1/admin/members/20/plan "{$ACT,\"mode\":\"grant\",\"plan\":\"gold\",\"until\":\"$UNTIL\"}" $TOKEN)" 400
+eq "ücretli üyede deneme hakkı yenilenmez → 400" "$(post /api/v1/admin/members/20/trial "{$ACT,\"action\":\"reset\"}" $TOKEN)" 400
+eq "deneme hakkını yenile (24: deneme bitmişti) → 200" "$(post /api/v1/admin/members/24/trial "{$ACT,\"action\":\"reset\"}" $TOKEN)" 200
+eq "24 yeniden deneme alabilir" "$(post /api/v1/trials/start '{"member_id":24,"email":"k24@x.test"}' $TOKEN)" 200
+eq "denemeyi bitir → 200" "$(post /api/v1/admin/members/24/trial "{$ACT,\"action\":\"end\"}" $TOKEN)" 200
+eq "deneme bitince Standard" "$(sql "SELECT user_type FROM customers WHERE member_id=24")" "Standard"
+eq "aktif deneme yokken bitir → 400" "$(post /api/v1/admin/members/24/trial "{$ACT,\"action\":\"end\"}" $TOKEN)" 400
+eq "başka servisin iz kaydı → 200" "$(post /api/v1/admin/audit "{$ACT,\"member_id\":30,\"action\":\"account.purge_now\",\"note\":\"test\"}" $TOKEN)" 200
+eq "geçersiz işlem adı → 400" "$(post /api/v1/admin/audit "{$ACT,\"member_id\":30,\"action\":\"DROP TABLE\"}" $TOKEN)" 400
+get "/api/v1/admin/audit?member_id=30" >/dev/null
+eq "üye 30 iz kaydı (en yeni önce)" "$(pyj "','.join(i['action'] for i in d['items'])")" "account.purge_now,plan.revoke,plan.grant,plan.limits,plan.grant"
+eq "iz kaydında önce/sonra ve not" "$(pyj "f\"{d['items'][-1]['before']['user_type']}/{d['items'][-1]['after']['user_type']}/{d['items'][-1]['note']}/{d['items'][-1]['actor_email']}\"")" "Standard/Enterprise/pilot/admin@x.test"
+
 echo "== Sonuç: $PASS geçti, $FAIL başarısız"
 [ "$FAIL" = 0 ]

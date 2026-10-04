@@ -469,9 +469,14 @@ pub async fn create_trial<'e>(
     .await?)
 }
 
+/// Deneme hakkını tüketen abonelikler: başlamış olan her abonelik; yöneticinin geçersiz saydığı
+/// (`trial_voided`) deneme hariç. `start_trial` de aynı koşulu kullanır.
+pub const TRIAL_CONSUMING: &str =
+    "member_id = $1 AND started_at IS NOT NULL AND NOT COALESCE((metadata->>'trial_voided')::boolean, false)";
+
 /// Deneme hakkı: hiç başlamış (ödemeli ya da deneme) aboneliği olmayan üye.
 pub async fn trial_eligible(pool: &PgPool, member_id: i32) -> Result<bool> {
-    Ok(sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM paytr_subscriptions WHERE member_id = $1 AND started_at IS NOT NULL)")
+    Ok(sqlx::query_scalar(&format!("SELECT NOT EXISTS(SELECT 1 FROM paytr_subscriptions WHERE {TRIAL_CONSUMING})"))
         .bind(member_id)
         .fetch_one(pool)
         .await?)

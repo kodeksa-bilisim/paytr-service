@@ -104,7 +104,7 @@ pub async fn erase(
 }
 
 /// Sorgunun satırlarını JSON dizisi olarak döner (sqlx `json` özelliği olmadan: metin üzerinden).
-async fn json_rows(state: &AppState, inner_sql: &str, member_id: i32) -> Result<Value, AppError> {
+pub(crate) async fn json_rows(state: &AppState, inner_sql: &str, member_id: i32) -> Result<Value, AppError> {
     let sql = format!("SELECT COALESCE(json_agg(row_to_json(x)), '[]'::json)::text FROM ({inner_sql}) x");
     let text: String = sqlx::query_scalar(&sql)
         .bind(member_id)

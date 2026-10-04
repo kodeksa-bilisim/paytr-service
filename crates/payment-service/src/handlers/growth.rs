@@ -67,10 +67,11 @@ pub async fn start_trial(State(state): State<AppState>, Json(req): Json<TrialReq
 
     let mut tx = state.db.begin().await.map_err(anyhow::Error::from)?;
     subscription_repo::lock_member(&mut *tx, req.member_id).await?;
-    let eligible: bool = sqlx::query_scalar(
-        "SELECT NOT EXISTS(SELECT 1 FROM paytr_subscriptions WHERE member_id = $1 AND started_at IS NOT NULL)
+    let eligible: bool = sqlx::query_scalar(&format!(
+        "SELECT NOT EXISTS(SELECT 1 FROM paytr_subscriptions WHERE {})
             AND EXISTS(SELECT 1 FROM customers WHERE member_id = $1)",
-    )
+        subscription_repo::TRIAL_CONSUMING
+    ))
     .bind(req.member_id)
     .fetch_one(&mut *tx)
     .await

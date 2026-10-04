@@ -135,6 +135,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/referrals/claim", post(handlers::growth::claim_referral))
         .route("/api/v1/admin/coupons", get(handlers::growth::list_coupons).post(handlers::growth::create_coupon))
         .route("/api/v1/admin/coupons/:code/active", post(handlers::growth::set_coupon_active))
+        // Yönetici üye işlemleri + iz kaydı
+        .route("/api/v1/admin/members/:member_id", get(handlers::admin_members::detail))
+        .route("/api/v1/admin/members/:member_id/plan", post(handlers::admin_members::set_plan))
+        .route("/api/v1/admin/members/:member_id/trial", post(handlers::admin_members::trial))
+        .route("/api/v1/admin/audit", get(handlers::admin_members::list_audit).post(handlers::admin_members::log_action))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&state), require_internal_token));
 
     let app = Router::new()
