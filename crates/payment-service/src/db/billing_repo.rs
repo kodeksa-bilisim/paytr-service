@@ -8,7 +8,7 @@ use crate::billing::{BillingProfile, InvoiceLine};
 
 pub async fn find_profile<'e>(ex: impl PgExecutor<'e>, member_id: i32) -> Result<Option<BillingProfile>> {
     Ok(sqlx::query_as::<_, BillingProfile>(
-        "SELECT kind, company_title, tax_number, tax_office, address, city, district, country
+        "SELECT kind, full_name, company_title, tax_number, tax_office, address, city, district, country
          FROM billing_profiles WHERE member_id = $1",
     )
     .bind(member_id)
@@ -21,11 +21,11 @@ pub async fn upsert_profile(pool: &PgPool, member_id: i32, p: &BillingProfile) -
     let r = sqlx::query(
         r#"
         INSERT INTO billing_profiles
-            (member_id, kind, company_title, tax_number, tax_office, address, city, district, country)
-        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
+            (member_id, kind, full_name, company_title, tax_number, tax_office, address, city, district, country)
+        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
         WHERE EXISTS (SELECT 1 FROM customers WHERE member_id = $1)
         ON CONFLICT (member_id) DO UPDATE SET
-            kind = EXCLUDED.kind, company_title = EXCLUDED.company_title,
+            kind = EXCLUDED.kind, full_name = EXCLUDED.full_name, company_title = EXCLUDED.company_title,
             tax_number = EXCLUDED.tax_number, tax_office = EXCLUDED.tax_office,
             address = EXCLUDED.address, city = EXCLUDED.city, district = EXCLUDED.district,
             country = EXCLUDED.country, updated_at = NOW()
@@ -33,6 +33,7 @@ pub async fn upsert_profile(pool: &PgPool, member_id: i32, p: &BillingProfile) -
     )
     .bind(member_id)
     .bind(&p.kind)
+    .bind(&p.full_name)
     .bind(&p.company_title)
     .bind(&p.tax_number)
     .bind(&p.tax_office)

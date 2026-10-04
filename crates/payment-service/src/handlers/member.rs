@@ -146,7 +146,7 @@ pub async fn export(
     .await?;
     let billing_profile = json_rows(
         &state,
-        "SELECT kind, company_title, tax_number, tax_office, address, city, district, country, updated_at
+        "SELECT kind, full_name, company_title, tax_number, tax_office, address, city, district, country, updated_at
          FROM billing_profiles WHERE member_id = $1",
         member_id,
     )

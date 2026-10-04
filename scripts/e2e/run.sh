@@ -227,6 +227,15 @@ eq "kayıt yok → null (bireysel sayılır)" "$(pyj "d['profile']")" None
 eq "kurumsal: vergi dairesi eksik → 400" "$(put /api/v1/billing-profile "$(echo "$CORP" | sed 's/"tax_office":"Kadıköy",//')")" 400
 eq "kurumsal: VKN'de harf → 400" "$(put /api/v1/billing-profile "$(echo "$CORP" | sed 's/1234567890/12345678ab/')")" 400
 eq "olmayan üye → 400" "$(put /api/v1/billing-profile "$(echo "$CORP" | sed 's/"member_id":3/"member_id":999/')")" 400
+IND='{"member_id":3,"kind":"individual","full_name":" Cem  Kaya ","tax_number":"12345678901","address":"Örnek Mah. 1. Sok. No:2","city":"İstanbul","district":"Kadıköy","company_title":"atılır"}'
+eq "bireysel: TCKN 10 hane → 400" "$(put /api/v1/billing-profile "$(echo "$IND" | sed 's/12345678901/1234567890/')")" 400
+eq "bireysel: yarım adres → 400" "$(put /api/v1/billing-profile "$(echo "$IND" | sed 's/"district":"Kadıköy",//')")" 400
+eq "bireysel kaydedildi → 200" "$(put /api/v1/billing-profile "$IND")" 200
+get /api/v1/billing-profile/3 >/dev/null
+eq "bireysel: ad normalleşti, unvan atıldı, TCKN ve adres var" "$(pyj "f\"{d['profile']['kind']}/{d['profile']['full_name']}/{d['profile']['company_title']}/{d['profile']['tax_number']}/{d['profile']['city']}\"")" "individual/Cem Kaya/None/12345678901/İstanbul"
+eq "bireysel: yalnızca tür (hepsi boş) → 200" "$(put /api/v1/billing-profile '{"member_id":3,"kind":"individual"}')" 200
+get /api/v1/billing-profile/3 >/dev/null
+eq "bireysel boş: ad/TCKN/adres temizlendi" "$(pyj "f\"{d['profile']['full_name']}/{d['profile']['tax_number']}/{d['profile']['address']}\"")" "None/None/None"
 eq "kurumsal kaydedildi → 200" "$(put /api/v1/billing-profile "$CORP")" 200
 get /api/v1/billing-profile/3 >/dev/null
 eq "kayıtlı bilgi okunuyor" "$(pyj "d['profile']['kind']+'/'+d['profile']['tax_number']+'/'+d['profile']['country']")" "corporate/1234567890/Türkiye"

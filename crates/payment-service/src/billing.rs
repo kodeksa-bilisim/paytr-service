@@ -80,7 +80,10 @@ pub fn single_line(description: String, total_kurus: i64) -> InvoiceLine {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct BillingProfile {
     pub kind: String,
+    /// Bireysel: faturadaki ad soyad (boşsa hesap adı).
+    pub full_name: Option<String>,
     pub company_title: Option<String>,
+    /// Kurumsal: VKN/TCKN (zorunlu). Bireysel: TCKN (isteğe bağlı).
     pub tax_number: Option<String>,
     pub tax_office: Option<String>,
     pub address: Option<String>,
@@ -90,9 +93,26 @@ pub struct BillingProfile {
 }
 
 /// Faturaya yazılan alıcı (kesim anındaki kopya; sonradan profil değişse de fatura değişmez).
-/// Bireyselde ad + e-posta yeterli (karar); kurumsalda vergi bilgileri ve adres.
+/// Bireyselde ad + e-posta, girildiyse TCKN ve adres; kurumsalda vergi bilgileri ve adres.
 pub fn buyer_snapshot(profile: Option<&BillingProfile>, name: &str, email: &str) -> serde_json::Value {
     match profile {
+        Some(p) if p.kind == "individual" => {
+            let mut b = serde_json::json!({
+                "type": "individual",
+                "name": p.full_name.as_deref().unwrap_or(name),
+                "email": email,
+            });
+            if let Some(t) = &p.tax_number {
+                b["tax_number"] = t.as_str().into();
+            }
+            if let (Some(a), Some(c), Some(d)) = (&p.address, &p.city, &p.district) {
+                b["address"] = a.as_str().into();
+                b["city"] = c.as_str().into();
+                b["district"] = d.as_str().into();
+                b["country"] = p.country.as_str().into();
+            }
+            b
+        }
         Some(p) if p.kind == "corporate" => serde_json::json!({
             "type": "corporate",
             "title": p.company_title,
@@ -112,6 +132,8 @@ pub fn buyer_snapshot(profile: Option<&BillingProfile>, name: &str, email: &str)
 #[derive(Debug, Deserialize)]
 pub struct BillingProfileInput {
     pub kind: String,
+    #[serde(default)]
+    pub full_name: Option<String>,
     pub company_title: Option<String>,
     pub tax_number: Option<String>,
     pub tax_office: Option<String>,
@@ -133,20 +155,44 @@ fn required(v: &Option<String>, field: &str, min: usize, max: usize) -> Result<S
     Ok(s)
 }
 
-/// Doğrular ve normalleştirir. Bireyselde kurumsal alanlar atılır.
-/// VKN 10, TCKN (şahıs şirketi) 11 hane; sağlama kontrolünü entegratör yapar.
+fn optional(v: &Option<String>, field: &str, min: usize, max: usize) -> Result<Option<String>, String> {
+    if clean(v).is_none() {
+        return Ok(None);
+    }
+    required(v, field, min, max).map(Some)
+}
+
+/// Doğrular ve normalleştirir.
+/// - Bireysel: ad soyad, TCKN (11 hane) ve adres isteğe bağlı; adres girilirse il ve ilçe de
+///   zorunlu (yarım adres faturaya yazılmaz). Unvan/vergi dairesi atılır.
+/// - Kurumsal: VKN 10, TCKN (şahıs şirketi) 11 hane; sağlama kontrolünü entegratör yapar.
 pub fn validate_profile(input: &BillingProfileInput) -> Result<BillingProfile, String> {
     match input.kind.as_str() {
-        "individual" => Ok(BillingProfile {
-            kind: "individual".into(),
-            company_title: None,
-            tax_number: None,
-            tax_office: None,
-            address: None,
-            city: None,
-            district: None,
-            country: "Türkiye".into(),
-        }),
+        "individual" => {
+            let tax_number = optional(&input.tax_number, "TC kimlik no", 11, 11)?;
+            if tax_number.as_deref().is_some_and(|t| !t.bytes().all(|b| b.is_ascii_digit())) {
+                return Err("TC kimlik no yalnızca rakam olmalı".into());
+            }
+            let address = optional(&input.address, "Adres", 5, 500)?;
+            let city = optional(&input.city, "İl", 2, 60)?;
+            let district = optional(&input.district, "İlçe", 2, 60)?;
+            let any = address.is_some() || city.is_some() || district.is_some();
+            let all = address.is_some() && city.is_some() && district.is_some();
+            if any && !all {
+                return Err("Adres girilecekse adres, il ve ilçe birlikte girilmeli".into());
+            }
+            Ok(BillingProfile {
+                kind: "individual".into(),
+                full_name: optional(&input.full_name, "Ad soyad", 2, 120)?,
+                company_title: None,
+                tax_number,
+                tax_office: None,
+                address,
+                city,
+                district,
+                country: "Türkiye".into(),
+            })
+        }
         "corporate" => {
             let tax_number = required(&input.tax_number, "Vergi/TC kimlik no", 10, 11)?;
             if !tax_number.bytes().all(|b| b.is_ascii_digit()) {
@@ -154,6 +200,7 @@ pub fn validate_profile(input: &BillingProfileInput) -> Result<BillingProfile, S
             }
             Ok(BillingProfile {
                 kind: "corporate".into(),
+                full_name: None,
                 company_title: Some(required(&input.company_title, "Unvan", 2, 250)?),
                 tax_number: Some(tax_number),
                 tax_office: Some(required(&input.tax_office, "Vergi dairesi", 2, 100)?),
@@ -212,6 +259,7 @@ mod tests {
     fn input(kind: &str) -> BillingProfileInput {
         BillingProfileInput {
             kind: kind.into(),
+            full_name: None,
             company_title: Some("  Kodeksa   Bilişim A.Ş. ".into()),
             tax_number: Some("1234567890".into()),
             tax_office: Some("Kadıköy".into()),
@@ -234,10 +282,53 @@ mod tests {
         let mut i = input("corporate");
         i.tax_office = None;
         assert!(validate_profile(&i).is_err());
-        // Bireyselde kurumsal alanlar saklanmaz
-        let p = validate_profile(&input("individual")).unwrap();
-        assert!(p.tax_number.is_none() && p.company_title.is_none());
         assert!(validate_profile(&input("other")).is_err());
+    }
+
+    fn individual() -> BillingProfileInput {
+        BillingProfileInput {
+            kind: "individual".into(),
+            full_name: Some("  Ayşe   Yılmaz ".into()),
+            company_title: Some("Kodeksa".into()),
+            tax_number: Some("12345678901".into()),
+            tax_office: Some("Kadıköy".into()),
+            address: Some("Örnek Mah. 1. Sok. No:2".into()),
+            city: Some("İstanbul".into()),
+            district: Some("Kadıköy".into()),
+        }
+    }
+
+    #[test]
+    fn individual_profile_validation() {
+        // Kurumsal alanlar atılır, bireysel alanlar normalleşir
+        let p = validate_profile(&individual()).unwrap();
+        assert_eq!(p.full_name.as_deref(), Some("Ayşe Yılmaz"));
+        assert!(p.company_title.is_none() && p.tax_office.is_none());
+        assert_eq!(p.tax_number.as_deref(), Some("12345678901"));
+        // Hepsi boş: geçerli (hesap adı + e-posta)
+        let empty = BillingProfileInput {
+            kind: "individual".into(),
+            full_name: Some("  ".into()),
+            company_title: None,
+            tax_number: None,
+            tax_office: None,
+            address: None,
+            city: None,
+            district: None,
+        };
+        let p = validate_profile(&empty).unwrap();
+        assert!(p.full_name.is_none() && p.tax_number.is_none() && p.address.is_none());
+        // TCKN 11 hane rakam
+        let mut i = individual();
+        i.tax_number = Some("1234567890".into());
+        assert!(validate_profile(&i).is_err());
+        let mut i = individual();
+        i.tax_number = Some("1234567890a".into());
+        assert!(validate_profile(&i).is_err());
+        // Yarım adres reddedilir
+        let mut i = individual();
+        i.district = None;
+        assert!(validate_profile(&i).is_err());
     }
 
     #[test]
@@ -250,5 +341,23 @@ mod tests {
         assert_eq!(b["type"], "corporate");
         assert_eq!(b["tax_number"], "1234567890");
         assert_eq!(b["email"], "a@x.test");
+        // Bireysel profil: girilen ad hesap adının önüne geçer; TCKN ve adres eklenir
+        let p = validate_profile(&individual()).unwrap();
+        let b = buyer_snapshot(Some(&p), "Ayşe", "a@x.test");
+        assert_eq!(b["type"], "individual");
+        assert_eq!(b["name"], "Ayşe Yılmaz");
+        assert_eq!(b["tax_number"], "12345678901");
+        assert_eq!(b["city"], "İstanbul");
+        // Bireysel, ad boş: hesap adı; TCKN/adres yoksa alan da yok
+        let mut i = individual();
+        i.full_name = None;
+        i.tax_number = None;
+        i.address = None;
+        i.city = None;
+        i.district = None;
+        let p = validate_profile(&i).unwrap();
+        let b = buyer_snapshot(Some(&p), "Ayşe", "a@x.test");
+        assert_eq!(b["name"], "Ayşe");
+        assert!(b.get("tax_number").is_none() && b.get("address").is_none());
     }
 }
