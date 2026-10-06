@@ -74,7 +74,7 @@ pub async fn create_sale<'e>(ex: impl PgExecutor<'e>, inv: NewInvoice<'_>) -> Re
         r#"
         INSERT INTO invoices
             (payment_id, merchant_oid, member_id, kind, buyer, lines, vat_rate,
-             net_kurus, vat_kurus, total_kurus, created_at, provider)
+             net_kurus, vat_kurus, total_kurus, created_at, source)
         VALUES ($1, $2, $3, 'sale', $4, $5, $6, $7, $8, $9, COALESCE($10, NOW()), $11)
         ON CONFLICT (merchant_oid, kind) DO NOTHING
         "#,

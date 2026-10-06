@@ -101,9 +101,18 @@ pub struct PaymentDto {
 
 #[derive(Serialize)]
 pub struct InvoiceRef {
+    /// Fatura kaydı (PDF, yeniden dene, elle kesildi işlemleri için).
+    id: Option<i32>,
     status: String,
     number: Option<String>,
+    /// Elle girilmiş dış bağlantı (eski kayıtlar).
     pdf_url: Option<String>,
+    /// Turkcell'de kesildi: PDF `/api/v1/invoices/:id/pdf` ile alınır.
+    has_pdf: bool,
+    /// earchive | efatura
+    doc_type: Option<String>,
+    /// Kesilemediyse son hata.
+    error: Option<String>,
 }
 
 impl From<PaymentRow> for PaymentDto {
@@ -114,7 +123,15 @@ impl From<PaymentRow> for PaymentDto {
             amount_kurus: amount_to_kurus(&p.amount),
             created_at: utc(p.created_at),
             callback_received_at: p.callback_received_at.map(utc),
-            invoice: p.invoice_status.map(|status| InvoiceRef { status, number: p.invoice_no, pdf_url: p.invoice_pdf_url }),
+            invoice: p.invoice_status.map(|status| InvoiceRef {
+                id: p.invoice_id,
+                status,
+                number: p.invoice_no,
+                pdf_url: p.invoice_pdf_url,
+                has_pdf: p.invoice_has_pdf.unwrap_or(false),
+                doc_type: p.invoice_doc_type,
+                error: p.invoice_error,
+            }),
             id: p.id,
             merchant_oid: p.merchant_oid,
             member_id: p.member_id,
@@ -449,7 +466,7 @@ pub struct BackfillResponse {
 
 /// POST /api/v1/admin/invoices/backfill?dry_run=true|false — fatura kaydı olmayan başarılı
 /// (test dışı) ödemeler için geriye dönük fatura kaydı. Kayıt ödeme anına tarihlenir (aylık
-/// CSV'de doğru aya düşer), `provider = 'backfill'` ile işaretlenir, durumu `pending`.
+/// CSV'de doğru aya düşer), `source = 'backfill'` ile işaretlenir, durumu `pending`.
 /// Bu ödemeler e-belge aktivasyonundan önce olduğu için entegratör üzerinden kesilemez;
 /// muhasebeci CSV'den elle keser. Tekrar çalıştırmak güvenli (ödeme başına tek fatura).
 pub async fn backfill_invoices(

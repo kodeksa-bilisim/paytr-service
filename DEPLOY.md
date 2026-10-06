@@ -220,6 +220,23 @@ bash deploy.sh --env
 - `GRACE_DAYS` (varsayılan 4), `MAX_FAILED_ATTEMPTS` (varsayılan 3): yenileme günde bir denenir,
   ödeme alınamayan abonelik bitişten `GRACE_DAYS` gün sonra expire edilir.
 - `.env` izinleri `600` olmalı (merchant key/salt içerir).
+- `EINVOICE_ENABLED=1` + `TURKCELL_EFATURA_BASE_URL` + `TURKCELL_EFATURA_API_KEY`: e-Arşiv / e-Fatura
+  kesimi (Turkcell e-Şirket). `EINVOICE_START_DATE` (TR günü) öncesi kayıtlar ve geriye dönük
+  (`source='backfill'`) kayıtlar otomatik kesilmez. Canlı ödemeler varken TEST adresini açmayın:
+  Turkcell faturayı alıcının e-postasına gönderir. Ayrıntı: aşağıdaki "e-Fatura" bölümü.
+
+### e-Fatura (Turkcell e-Şirket)
+Ödeme callback'i `invoices` kaydını `pending` açar; arka plan görevi (`src/einvoice/worker.rs`)
+dakikada bir bekleyenleri keser. Alıcının VKN/TCKN'si GİB e-Fatura listesindeyse e-Fatura (temel
+senaryo, posta kutusu listeden), değilse e-Arşiv (Turkcell müşteriye e-posta gönderir). Liste günde
+bir `einvoice_users` tablosuna indirilir.
+- ETTN gönderimden önce yazılır; yeniden denemede önce ETTN ile durum sorgulanır → çift fatura yok.
+- KDV ve dip toplam bizden gider (`useCalculatedVatAmount`): fatura toplamı tahsilatla kuruşu kuruşuna aynı.
+- Geçici hata: 2, 4, 8 … dk (en çok 6 sa) beklemeyle 8 deneme; kalıcı hata (422, 401/403) ya da 8.
+  deneme → `failed` + `ALERT_EMAIL`. Yönetici panelinde "Yeniden dene" / "Elle kesildi".
+- Kesilen faturanın GİB sonucu 2 gün izlenir (60 onay, 40 hata → `failed` + uyarı).
+- Uçlar: `GET /api/v1/members/:id/invoices`, `GET /api/v1/invoices/:id/pdf?member_id=`,
+  `POST /api/v1/admin/invoices/:id/{retry,manual}`.
 
 ### Abonelik yaşam döngüsü
 `pending → active → (cancelled →) expired`; upgrade ile yerini yenisine bırakan abonelik

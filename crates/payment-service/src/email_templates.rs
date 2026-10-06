@@ -539,6 +539,28 @@ pub fn payment_review_alert(reason: &str, details: Vec<(&str, String)>, site_url
     })
 }
 
+/// Yönetici uyarısı: bir fatura entegratörde kesilemedi ya da GİB'e iletilemedi.
+pub fn invoice_failed_alert(reason: &str, details: Vec<(&str, String)>, site_url: &str) -> EmailContent {
+    let short: String = reason.chars().take(80).collect();
+    let subject = format!("[nlink fatura] Kesilemedi: {short}");
+    render(&Layout {
+        subject: &subject,
+        preheader: "Bir fatura otomatik kesilemedi; yönetici paneli Ödemeler sayfasından yeniden denenebilir.",
+        eyebrow: "Yönetici Uyarısı",
+        heading: "Fatura kesilemedi",
+        greeting: "Merhaba,".to_string(),
+        paragraphs: vec![format!(
+            "Aşağıdaki ödemenin faturası Turkcell e-Şirket'te otomatik kesilemedi (neden: <strong>{}</strong>).              Ödeme ve abonelik etkilenmedi. Sorun giderildikten sonra yönetici panelindeki              <strong>Ödemeler</strong> sayfasından \"Yeniden dene\" ile ya da elle kesilip \"Elle kesildi\" ile kapatılabilir.",
+            esc(reason)
+        )],
+        features: vec![],
+        details,
+        cta: None,
+        note: Some("Fatura kaydının durumu <code>failed</code> olarak işaretlendi.".to_string()),
+        site_url,
+    })
+}
+
 /// Ücretsiz deneme bitmek üzere (bitişten ~2 gün önce).
 pub fn trial_ending(name: Option<&str>, plan: &str, ends_at: chrono::NaiveDateTime, site_url: &str) -> EmailContent {
     let plan_l = plan_label(plan);

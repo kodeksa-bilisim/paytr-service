@@ -27,6 +27,10 @@ pub struct PaymentRow {
     pub invoice_status: Option<String>,
     pub invoice_no: Option<String>,
     pub invoice_pdf_url: Option<String>,
+    pub invoice_id: Option<i32>,
+    pub invoice_error: Option<String>,
+    pub invoice_doc_type: Option<String>,
+    pub invoice_has_pdf: Option<bool>,
 }
 
 const PAYMENT_SELECT: &str = r#"
@@ -34,7 +38,9 @@ const PAYMENT_SELECT: &str = r#"
            s.plan, s.billing_cycle, p.amount, p.currency, p.status,
            p.failed_reason_code, p.failed_reason_msg, p.is_3d, p.test_mode,
            p.installment_count, p.callback_received_at, p.created_at,
-           i.status AS invoice_status, i.invoice_no, i.pdf_url AS invoice_pdf_url
+           i.status AS invoice_status, i.invoice_no, i.pdf_url AS invoice_pdf_url,
+           i.id AS invoice_id, i.last_error AS invoice_error, i.doc_type AS invoice_doc_type,
+           (i.status = 'issued' AND i.provider = 'turkcell' AND i.ettn IS NOT NULL) AS invoice_has_pdf
     FROM paytr_payments p
     LEFT JOIN customers cu ON cu.member_id = p.member_id
     LEFT JOIN paytr_subscriptions s ON s.id = p.subscription_id

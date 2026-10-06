@@ -13,6 +13,69 @@ pub struct EmailConfig {
     pub site_url: String,
 }
 
+/// e-Arşiv / e-Fatura entegratörü (Turkcell e-Şirket). Tanımlı değilse faturalar `pending` kalır.
+#[derive(Clone)]
+pub struct EinvoiceConfig {
+    /// `https://efaturaservicetest.isim360.com` (test) ya da `https://efaturaservice.turkcellesirket.com`.
+    pub base_url: String,
+    pub api_key: String,
+    /// Bu tarihten (UTC) önce açılan kayıtlar otomatik kesilmez (e-belge geçişinden önceki ödemeler).
+    pub start_at: Option<chrono::NaiveDateTime>,
+    /// e-Arşiv internet satışında zorunlu taşıyıcı bilgisi (dijital hizmet: yer tutucu).
+    pub shipment_id: String,
+    pub shipment_name: String,
+    /// Faturada görünen satış sitesi.
+    pub website: String,
+    /// Birden çok seri varsa fatura numarası ön eki (ör. `NLK`); boşsa entegratörün varsayılanı.
+    pub prefix: Option<String>,
+}
+
+impl std::fmt::Debug for EinvoiceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EinvoiceConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"[REDACTED]")
+            .field("start_at", &self.start_at)
+            .field("prefix", &self.prefix)
+            .finish()
+    }
+}
+
+/// `EINVOICE_ENABLED=1` ve Turkcell adresi + anahtarı tanımlıysa Some.
+fn build_einvoice_config() -> anyhow::Result<Option<EinvoiceConfig>> {
+    let var = |k: &str| std::env::var(k).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    if var("EINVOICE_ENABLED").as_deref() != Some("1") {
+        return Ok(None);
+    }
+    let base_url = var("TURKCELL_EFATURA_BASE_URL").context("EINVOICE_ENABLED=1 ama TURKCELL_EFATURA_BASE_URL eksik")?;
+    // Yerel adres yalnızca uçtan uca testlerdeki sahte sunucu için.
+    anyhow::ensure!(
+        base_url.starts_with("https://") || base_url.starts_with("http://127.0.0.1:"),
+        "TURKCELL_EFATURA_BASE_URL https olmalı"
+    );
+    let api_key = var("TURKCELL_EFATURA_API_KEY").context("EINVOICE_ENABLED=1 ama TURKCELL_EFATURA_API_KEY eksik")?;
+    // Tarih Türkiye günü olarak verilir (ör. 2026-10-15) → o günün 00:00 TR = önceki gün 21:00 UTC.
+    let start_at = match var("EINVOICE_START_DATE") {
+        Some(d) => Some(
+            chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d")
+                .context("EINVOICE_START_DATE YYYY-MM-DD olmalı")?
+                .and_hms_opt(0, 0, 0)
+                .expect("geçerli saat")
+                - chrono::Duration::hours(3),
+        ),
+        None => None,
+    };
+    Ok(Some(EinvoiceConfig {
+        base_url: base_url.trim_end_matches('/').to_string(),
+        api_key,
+        start_at,
+        shipment_id: var("EINVOICE_SHIPMENT_TCKNVKN").unwrap_or_else(|| "1111111111".into()),
+        shipment_name: var("EINVOICE_SHIPMENT_NAME").unwrap_or_else(|| "Elektronik teslimat".into()),
+        website: var("EINVOICE_WEBSITE").unwrap_or_else(|| "https://nlink.tr".into()),
+        prefix: var("EINVOICE_PREFIX"),
+    }))
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub merchant_id: String,
@@ -52,6 +115,8 @@ pub struct Config {
     /// Dış izlemenin heartbeat adresi (`HEARTBEAT_URL_SCHEDULER`, ör. Better Stack). Her başarılı
     /// scheduler çalışmasından sonra GET atılır; ping gelmezse izleme servisi uyarı verir.
     pub heartbeat_url: Option<String>,
+    /// e-Arşiv / e-Fatura kesimi (Turkcell e-Şirket); None = kapalı.
+    pub einvoice: Option<EinvoiceConfig>,
 }
 
 /// "1, 7,x" → [1, 7]; geçersiz parçalar yok sayılır.
@@ -80,6 +145,7 @@ impl std::fmt::Debug for Config {
             .field("sync_mode", &self.sync_mode)
             .field("invoice_exempt_members", &self.invoice_exempt_members)
             .field("heartbeat_url", &self.heartbeat_url.as_ref().map(|_| "[SET]"))
+            .field("einvoice", &self.einvoice)
             .field("internal_api_token", &"[REDACTED]")
             .finish()
     }
@@ -153,6 +219,7 @@ impl Config {
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| s.starts_with("https://")),
+            einvoice: build_einvoice_config()?,
         })
     }
 }

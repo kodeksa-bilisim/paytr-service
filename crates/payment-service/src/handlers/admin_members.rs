@@ -32,7 +32,7 @@ fn bad(msg: &str) -> AppError {
     AppError::BadRequest(msg.to_string())
 }
 
-async fn audit<'e>(
+pub(crate) async fn audit<'e>(
     ex: impl PgExecutor<'e>,
     actor: &Actor,
     member_id: i32,
@@ -81,8 +81,8 @@ async fn plan_state<'e>(ex: impl PgExecutor<'e>, member_id: i32) -> Result<Optio
 
 #[derive(Deserialize)]
 pub struct Actor {
-    actor_id: i32,
-    actor_email: Option<String>,
+    pub(crate) actor_id: i32,
+    pub(crate) actor_email: Option<String>,
 }
 
 // ── Üye özeti ────────────────────────────────────────────────────────────────

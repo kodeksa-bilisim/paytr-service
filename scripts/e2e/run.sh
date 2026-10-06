@@ -27,6 +27,7 @@ eq()  { [ "$2" = "$3" ] && ok "$1" || bad "$1" "beklenen '$3', gelen '$2'"; }
 cleanup() {
   [ -n "${SVC_PID:-}" ] && kill "$SVC_PID" 2>/dev/null
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null
+  [ -n "${TC_PID:-}" ] && kill "$TC_PID" 2>/dev/null
   docker rm -f $PG >/dev/null 2>&1
   [ "$FAIL" = 0 ] && rm -rf "$WORK" || echo "Loglar: $WORK"
 }
@@ -333,7 +334,7 @@ eq "şirket içi hesap atlanıyor" "$(pyj "next(i['reason'] for i in d['items'] 
 eq "gerçek çalıştırma → 200" "$(post '/api/v1/admin/invoices/backfill?dry_run=false' '' $TOKEN)" 200
 eq "1 oluşturuldu; okunamayan tutar ve şirket içi hesap atlandı" "$(pyj "f\"{d['created']}/{d['skipped']}/\" + ','.join(i['action'] for i in d['items'])")" "1/2/created,skipped,skipped"
 eq "şirket içi hesaba geriye dönük kayıt da açılmadı" "$(sql "SELECT count(*) FROM invoices WHERE merchant_oid='$P105'")" 0
-eq "kayıt ödeme anına tarihli, işaretli, açıklamalı" "$(sql "SELECT provider||'/'||status||'/'||(created_at = (SELECT callback_received_at FROM paytr_payments WHERE merchant_oid='r101t1000'))||'/'||(lines->0->>'name')||'/'||total_kurus FROM invoices WHERE merchant_oid='r101t1000'")" "backfill/pending/true/nlink Gold plan aboneliği (aylık) — yenileme/29900"
+eq "kayıt ödeme anına tarihli, işaretli, açıklamalı" "$(sql "SELECT source||'/'||status||'/'||(created_at = (SELECT callback_received_at FROM paytr_payments WHERE merchant_oid='r101t1000'))||'/'||(lines->0->>'name')||'/'||total_kurus FROM invoices WHERE merchant_oid='r101t1000'")" "backfill/pending/true/nlink Gold plan aboneliği (aylık) — yenileme/29900"
 eq "test ödemesine fatura kaydı yok" "$(sql "SELECT count(*) FROM invoices WHERE merchant_oid='u1t2000'")" 0
 post '/api/v1/admin/invoices/backfill?dry_run=false' '' $TOKEN >/dev/null
 eq "tekrar çalıştırmak güvenli (yeni kayıt yok)" "$(pyj "d['created']")/$(sql "SELECT count(*) FROM invoices WHERE merchant_oid='r101t1000'")" "0/1"
@@ -488,6 +489,84 @@ eq "geçersiz işlem adı → 400" "$(post /api/v1/admin/audit "{$ACT,\"member_i
 get "/api/v1/admin/audit?member_id=30" >/dev/null
 eq "üye 30 iz kaydı (en yeni önce)" "$(pyj "','.join(i['action'] for i in d['items'])")" "account.purge_now,plan.revoke,plan.grant,plan.limits,plan.grant"
 eq "iz kaydında önce/sonra ve not" "$(pyj "f\"{d['items'][-1]['before']['user_type']}/{d['items'][-1]['after']['user_type']}/{d['items'][-1]['note']}/{d['items'][-1]['actor_email']}\"")" "Standard/Enterprise/pilot/admin@x.test"
+
+echo "== e-Fatura / e-Arşiv kesimi (sahte Turkcell)"
+TC_PORT=38081
+TC_LOG=$WORK/turkcell.log
+python3 "$HERE/mock_turkcell.py" $TC_PORT "$TC_LOG" & TC_PID=$!
+# Servisi süreç adıyla durdur ($SVC_PID alt kabuktur) ve portun boşalmasını bekle.
+pkill -f "$ROOT/target/debug/payment-service" 2>/dev/null
+for _ in $(seq 1 30); do curl -s -o /dev/null "$BASE/health" || break; sleep 0.5; done
+# Önceki bölümlerin bekleyen kayıtları bu bölümü karıştırmasın.
+sql "UPDATE invoices SET status='manual' WHERE status='pending' AND source IS DISTINCT FROM 'backfill';" >/dev/null
+inv() { # oid member buyer_json net vat [source]
+  sql "INSERT INTO invoices (merchant_oid, member_id, kind, status, buyer, lines, vat_rate, net_kurus, vat_kurus, total_kurus, source)
+       VALUES ('$1', $2, 'sale', 'pending', '$3'::jsonb, '[{\"name\":\"nlink Gold plan aboneliği (aylık)\"}]'::jsonb, 20, $4, $5, $4 + $5, ${6:-NULL});"
+}
+inv ein1 40 '{"type":"individual","name":"Ayşe Yılmaz","email":"ayse@x.test"}' 24917 4983
+inv ein2 41 '{"type":"corporate","title":"Test Kurum İki","tax_number":"1234567802","tax_office":"Kadıköy","address":"Örnek Mah. 1","city":"İstanbul","district":"Kadıköy","country":"Türkiye","email":"k@x.test"}' 24917 4983
+inv ein3 42 '{"type":"individual","name":"Hata422 Test","email":"h@x.test"}' 24917 4983
+inv ein4 43 '{"type":"individual","name":"Gecici Test","email":"g@x.test"}' 88 17
+inv ein5 44 '{"type":"individual","name":"DusenYanit Test","email":"d@x.test"}' 24917 4983
+inv ein6 45 '{"type":"individual","name":"Eski Kayıt","email":"e@x.test"}' 24917 4983 "'backfill'"
+inv ein7 46 '{"type":"corporate","title":"Liste Dışı A.Ş.","tax_number":"1111111112","tax_office":"Şişli","address":"Örnek 2","city":"İstanbul","district":"Şişli","country":"Türkiye","email":"l@x.test"}' 24917 4983
+
+( cd "$WORK" && env -i PATH="$PATH" \
+    DATABASE_URL="postgres://postgres:pw@127.0.0.1:$PGPORT/postgres" \
+    MERCHANT_ID=m1 MERCHANT_KEY=$KEY MERCHANT_SALT=$SALT HOST=127.0.0.1 PORT=$SVC_PORT TEST_MODE=0 \
+    BASE_URL=$BASE SCHEDULER_INTERVAL_SECS=3600 SCHEDULER_START_DELAY_SECS=3600 GRACE_DAYS=4 \
+    MAX_FAILED_ATTEMPTS=3 INTERNAL_API_TOKEN=$TOKEN PAYTR_BASE_URL=http://127.0.0.1:$MOCK_PORT \
+    INVOICE_EXEMPT_MEMBERS=12 \
+    EINVOICE_ENABLED=1 TURKCELL_EFATURA_BASE_URL=http://127.0.0.1:$TC_PORT TURKCELL_EFATURA_API_KEY=tc-test-key \
+    EINVOICE_INTERVAL_SECS=2 EINVOICE_START_DELAY_SECS=1 \
+    RUST_LOG=payment_service=debug "$ROOT/target/debug/payment-service" >> "$SVC_LOG" 2>&1 ) & SVC_PID=$!
+for _ in $(seq 1 30); do curl -s "$BASE/health" >/dev/null && break; sleep 1; done
+sleep 6
+istate() { sql "SELECT status||'/'||coalesce(doc_type,'-')||'/'||coalesce(provider,'-') FROM invoices WHERE merchant_oid='$1'"; }
+tcreq() { python3 -c "
+import json,sys
+for l in open('$TC_LOG'):
+    r=json.loads(l)
+    if r.get('body',{}).get('localReferenceId')=='$1': print(eval(sys.argv[1])); break
+" "$2"; }
+eq "GİB listesi: etkin alıcı kutusu, defaultpk tercih" "$(sql "SELECT count(*)||'/'||max(alias) FROM einvoice_users")" "1/urn:mail:defaultpk@kurum2.com"
+eq "bireysel → e-Arşiv kesildi" "$(istate ein1)" "issued/earchive/turkcell"
+eq "fatura no + ETTN yazıldı" "$(sql "SELECT (invoice_no LIKE 'NLK2026%')::text||'/'||(provider_ref = ettn::text)::text FROM invoices WHERE merchant_oid='ein1'")" "true/true"
+eq "e-Arşiv modeli: kayıt türü, KDV bizden, e-posta" "$(tcreq ein1 "f\"{r['body']['recordType']}/{r['body']['invoiceLines'][0]['lineExtensionAmount']}/{r['body']['invoiceLines'][0]['vatAmount']}/{r['body']['eArsivInfo']['sendEMail']}/{r['body']['addressBook']['identificationNumber']}\"")" "0/249.17/49.83/True/11111111111"
+eq "GİB listesindeki kurumsal → e-Fatura (temel)" "$(istate ein2)" "issued/efatura/turkcell"
+eq "e-Fatura modeli: posta kutusu, senaryo" "$(tcreq ein2 "f\"{r['path']}/{r['body']['addressBook']['alias']}/{r['body']['generalInfoModel']['invoiceProfileType']}\"")" "/v1/outboxinvoice/create/urn:mail:defaultpk@kurum2.com/0"
+eq "listede olmayan kurumsal → e-Arşiv, VKN ile" "$(istate ein7)/$(tcreq ein7 "r['body']['addressBook']['identificationNumber']")" "issued/earchive/turkcell/1111111112"
+eq "422 → kalıcı hata" "$(sql "SELECT status||'/'||(last_error LIKE '%reddetti%')::text FROM invoices WHERE merchant_oid='ein3'")" "failed/true"
+eq "geçici hata → beklemede, yeniden denenecek" "$(sql "SELECT status||'/'||attempts||'/'||(next_attempt_at > now() at time zone 'utc')::text FROM invoices WHERE merchant_oid='ein4'")" "pending/1/true"
+eq "gönderildi ama yanıt düştü → beklemede" "$(sql "SELECT status FROM invoices WHERE merchant_oid='ein5'")" "pending"
+eq "geriye dönük kayıt kesilmez" "$(sql "SELECT status||'/'||attempts FROM invoices WHERE merchant_oid='ein6'")" "pending/0"
+sql "UPDATE invoices SET next_attempt_at = NULL WHERE merchant_oid IN ('ein4','ein5');" >/dev/null
+sleep 5
+eq "geçici hatadan sonra kesildi" "$(istate ein4)" "issued/earchive/turkcell"
+eq "1,05 TL: KDV 0,17 (tahsilatla aynı)" "$(python3 -c "
+import json
+r=[json.loads(l) for l in open('$TC_LOG') if json.loads(l).get('body',{}).get('localReferenceId')=='ein4'][-1]
+print(r['body']['invoiceLines'][0]['vatAmount'])")" "0.17"
+eq "yanıtı düşen fatura: durumdan tamamlandı" "$(istate ein5)" "issued/earchive/turkcell"
+eq "yanıtı düşen fatura: ikinci kez gönderilmedi" "$(grep -c '"localReferenceId": "ein5"' "$TC_LOG")" "1"
+ID1=$(sql "SELECT id FROM invoices WHERE merchant_oid='ein1'")
+ID3=$(sql "SELECT id FROM invoices WHERE merchant_oid='ein3'")
+ID6=$(sql "SELECT id FROM invoices WHERE merchant_oid='ein6'")
+H=$(curl -s -D - -o "$WORK/f.pdf" -H "X-Internal-Token: $TOKEN" "$BASE/api/v1/invoices/$ID1/pdf?member_id=40" | tr -d '\r' | grep -i '^content-type' | cut -d' ' -f2)
+eq "PDF (sahibi) → application/pdf" "$H/$(head -c 4 "$WORK/f.pdf")" "application/pdf/%PDF"
+eq "PDF başka üye → 404" "$(get "/api/v1/invoices/$ID1/pdf?member_id=41")" 404
+eq "PDF token'sız → 401" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/v1/invoices/$ID1/pdf")" 401
+get /api/v1/members/40/invoices >/dev/null
+eq "üyenin faturaları" "$(pyj "f\"{len(d['items'])}/{d['items'][0]['has_pdf']}/{d['items'][0]['invoice_no'][:7]}\"")" "1/True/NLK2026"
+ACTI='"actor":{"actor_id":1,"actor_email":"admin@x.test"}'
+eq "yönetici: yeniden dene → 200" "$(post /api/v1/admin/invoices/$ID3/retry "{$ACTI,\"note\":\"alıcı düzeltildi\"}" $TOKEN)" 200
+sleep 4
+eq "yeniden denendi (alıcı hâlâ hatalı → yine hata, iki gönderim)" "$(sql "SELECT status FROM invoices WHERE id=$ID3")/$(grep -c '"localReferenceId": "ein3"' "$TC_LOG")" "failed/2"
+eq "yönetici: elle kesildi → 200" "$(post /api/v1/admin/invoices/$ID6/manual "{$ACTI,\"invoice_no\":\"ABC2026000000001\"}" $TOKEN)" 200
+eq "elle kesildi + numara" "$(sql "SELECT status||'/'||invoice_no FROM invoices WHERE id=$ID6")" "manual/ABC2026000000001"
+eq "kesilmiş fatura elle kapatılamaz → 400" "$(post /api/v1/admin/invoices/$ID1/manual "{$ACTI}" $TOKEN)" 400
+eq "iz kaydı" "$(sql "SELECT string_agg(action, ',' ORDER BY id) FROM admin_actions WHERE action LIKE 'invoice.%'")" "invoice.retry,invoice.manual"
+kill "$TC_PID" 2>/dev/null
 
 echo "== Sonuç: $PASS geçti, $FAIL başarısız"
 [ "$FAIL" = 0 ]
