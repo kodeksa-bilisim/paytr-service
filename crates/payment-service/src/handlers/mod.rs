@@ -3,6 +3,7 @@ pub mod admin_members;
 pub mod billing;
 pub mod callback;
 pub mod growth;
+pub mod fees;
 pub mod invoices;
 pub mod member;
 pub mod payment;

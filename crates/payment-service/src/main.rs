@@ -7,6 +7,7 @@ mod email;
 mod einvoice;
 mod email_templates;
 mod error;
+mod fees;
 mod growth;
 mod handlers;
 mod models;
@@ -127,6 +128,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/admin/invoices/backfill", post(handlers::admin::backfill_invoices))
         .route("/api/v1/admin/invoices/:id/retry", post(handlers::invoices::retry))
         .route("/api/v1/admin/invoices/:id/manual", post(handlers::invoices::manual))
+        .route("/api/v1/admin/fee-rates", get(handlers::fees::list).post(handlers::fees::create))
+        .route("/api/v1/admin/fee-rates/:id/delete", post(handlers::fees::delete))
         .route("/api/v1/invoices/:id/pdf", get(handlers::invoices::pdf))
         .route("/api/v1/members/:member_id/invoices", get(handlers::invoices::list_for_member))
         // Üyenin fatura bilgisi; member_id Next.js'te oturumdan alınır.

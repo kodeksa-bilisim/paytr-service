@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     db::admin_repo::{self, PaymentFilter, PaymentRow, ProblemSubscriptionRow},
     error::AppError,
+    fees::{self, FeeSchedule},
     paytr_client,
     pricing::amount_to_kurus,
     AppState,
@@ -84,6 +85,9 @@ pub struct PaymentDto {
     kind: &'static str,
     /// Kuruş; kayıttaki tutar okunamazsa null (ham değer `amount`'ta).
     amount_kurus: Option<i64>,
+    /// Tahmini ödeme kuruluşu komisyonu (KDV dahil), kuruş: yalnızca başarılı, test dışı
+    /// ödemelerde ve ödeme anında geçerli bir oran girilmişse.
+    fee_kurus: Option<i64>,
     amount: String,
     currency: String,
     status: String,
@@ -115,12 +119,18 @@ pub struct InvoiceRef {
     error: Option<String>,
 }
 
-impl From<PaymentRow> for PaymentDto {
-    fn from(p: PaymentRow) -> Self {
+impl PaymentDto {
+    fn new(p: PaymentRow, fees: &FeeSchedule) -> Self {
+        let amount_kurus = amount_to_kurus(&p.amount);
+        let fee_kurus = match (p.status.as_str(), p.test_mode, amount_kurus) {
+            ("success", false, Some(a)) => fees.fee(p.callback_received_at.unwrap_or(p.created_at), a),
+            _ => None,
+        };
         Self {
             kind: payment_kind(&p.merchant_oid),
             failure_class: failure_class(&p.status, p.is_3d, p.failed_reason_msg.as_deref()),
-            amount_kurus: amount_to_kurus(&p.amount),
+            amount_kurus,
+            fee_kurus,
             created_at: utc(p.created_at),
             callback_received_at: p.callback_received_at.map(utc),
             invoice: p.invoice_status.map(|status| InvoiceRef {
@@ -186,14 +196,15 @@ pub async fn list_payments(
     let filter = PaymentFilter {
         status,
         kind,
-        q: q.q.as_deref().map(|s| &s[..s.len().min(100)]),
+        // Bayt değil karakter sınırı: çok baytlı harfin ortasından kesmek panikler.
+        q: q.q.as_deref().map(|s| s.char_indices().nth(100).map_or(s, |(i, _)| &s[..i])),
         limit,
         offset: q.offset.unwrap_or(0).clamp(0, 100_000),
     };
-    let mut rows = admin_repo::list_payments(&state.db, &filter).await?;
+    let (mut rows, fees) = tokio::try_join!(admin_repo::list_payments(&state.db, &filter), fees::schedule(&state.db))?;
     let has_more = rows.len() as i64 > limit;
     rows.truncate(limit as usize);
-    Ok(Json(PaymentListResponse { items: rows.into_iter().map(Into::into).collect(), has_more }))
+    Ok(Json(PaymentListResponse { items: rows.into_iter().map(|p| PaymentDto::new(p, &fees)).collect(), has_more }))
 }
 
 #[derive(Serialize)]
@@ -275,6 +286,10 @@ pub struct OverviewResponse {
     failed_7d_by_class: BTreeMap<&'static str, i64>,
     /// Son 30 günde başarılı ödemelerin toplamı (test ödemeleri hariç), kuruş.
     revenue_30d_kurus: i64,
+    /// Bu tahsilatın tahmini komisyonu (KDV dahil), kuruş; hiç oran girilmemişse null.
+    fee_30d_kurus: Option<i64>,
+    /// Ödeme anında geçerli oranı olmayan (komisyonu hesaba katılmayan) başarılı ödemeler.
+    fee_30d_uncovered: i64,
     /// Faturalama başladıktan sonra başarılı olup fatura kaydı oluşmamış ödemeler (normalde 0).
     payments_without_invoice: i64,
     subscriptions: Vec<ProblemSubscriptionDto>,
@@ -283,23 +298,29 @@ pub struct OverviewResponse {
 
 /// GET /api/v1/admin/overview — özet sayılar, zamanlayıcı durumu, dikkat isteyen kayıtlar.
 pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse>, AppError> {
-    let (statuses_30d, last_renewal, subs, payments, payments_without_invoice) = tokio::try_join!(
+    let (statuses_30d, last_renewal, subs, payments, payments_without_invoice, fees) = tokio::try_join!(
         admin_repo::recent_statuses(&state.db, 30),
         admin_repo::last_renewal_success(&state.db),
         admin_repo::problem_subscriptions(&state.db),
         admin_repo::attention_payments(&state.db),
         admin_repo::payments_without_invoice(&state.db, &state.config.invoice_exempt_members),
+        fees::schedule(&state.db),
     )?;
 
     let week_ago = Utc::now().naive_utc() - Duration::days(7);
     let mut counts_7d: BTreeMap<&'static str, i64> = STATUSES.iter().map(|s| (*s, 0)).collect();
     let mut failed_7d_by_class: BTreeMap<&'static str, i64> =
         ["bank", "merchant", "abandoned", "system"].iter().map(|s| (*s, 0)).collect();
-    let mut revenue_30d_kurus = 0;
+    let (mut revenue_30d_kurus, mut fee_30d_kurus, mut fee_30d_uncovered) = (0, 0, 0);
     for r in &statuses_30d {
         // Tahsilat: test ve şirket içi hesap ödemeleri satış değildir.
         if r.status == "success" && !r.test_mode && !state.config.is_invoice_exempt(r.member_id) {
-            revenue_30d_kurus += amount_to_kurus(&r.amount).unwrap_or(0);
+            let amount = amount_to_kurus(&r.amount).unwrap_or(0);
+            revenue_30d_kurus += amount;
+            match fees.fee(r.created_at, amount) {
+                Some(f) => fee_30d_kurus += f,
+                None => fee_30d_uncovered += 1,
+            }
         }
         if r.created_at < week_ago {
             continue;
@@ -327,12 +348,14 @@ pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResp
         counts_7d,
         failed_7d_by_class,
         revenue_30d_kurus,
+        fee_30d_kurus: (!fees.is_empty()).then_some(fee_30d_kurus),
+        fee_30d_uncovered,
         payments_without_invoice,
         subscriptions: subs
             .into_iter()
             .map(|s| problem_dto(s, state.config.grace_days, state.config.max_failed_attempts))
             .collect(),
-        payments: payments.into_iter().map(Into::into).collect(),
+        payments: payments.into_iter().map(|p| PaymentDto::new(p, &fees)).collect(),
     }))
 }
 

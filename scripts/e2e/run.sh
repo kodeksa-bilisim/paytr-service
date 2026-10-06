@@ -568,5 +568,31 @@ eq "kesilmiş fatura elle kapatılamaz → 400" "$(post /api/v1/admin/invoices/$
 eq "iz kaydı" "$(sql "SELECT string_agg(action, ',' ORDER BY id) FROM admin_actions WHERE action LIKE 'invoice.%'")" "invoice.retry,invoice.manual"
 kill "$TC_PID" 2>/dev/null
 
+echo "== Komisyon oranları (yönetici)"
+sql "INSERT INTO paytr_payments(member_id,merchant_oid,amount,status,callback_received_at,created_at) VALUES (3,'fee1','299.00','success',$UTC,$UTC)"
+get /api/v1/admin/overview >/dev/null
+eq "oran yokken komisyon → null" "$(pyj "d['fee_30d_kurus']")" "None"
+eq "komisyon token'sız → 401" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/v1/admin/fee-rates")" 401
+eq "oran ekle (%2,49 + KDV) → 200" "$(post /api/v1/admin/fee-rates "{$ACTI,\"rate\":\"2,49\",\"vat_rate\":20,\"effective_from\":\"2026-01-01\",\"note\":\"PayTR sözleşmesi\"}" $TOKEN)" 200
+eq "aynı gün ikinci oran → 400" "$(post /api/v1/admin/fee-rates "{$ACTI,\"rate\":\"2\",\"vat_rate\":20,\"effective_from\":\"2026-01-01\"}" $TOKEN)" 400
+eq "oran %20'den büyük → 400" "$(post /api/v1/admin/fee-rates "{$ACTI,\"rate\":\"25\",\"vat_rate\":20}" $TOKEN)" 400
+eq "oran sayı değil → 400" "$(post /api/v1/admin/fee-rates "{$ACTI,\"rate\":\"abc\",\"vat_rate\":20}" $TOKEN)" 400
+eq "sabit ücret negatif → 400" "$(post /api/v1/admin/fee-rates "{$ACTI,\"rate\":\"2\",\"fixed\":\"-1\",\"vat_rate\":20}" $TOKEN)" 400
+eq "ileri tarihli oran → 200" "$(post /api/v1/admin/fee-rates "{$ACTI,\"rate\":\"3\",\"fixed\":\"0,25\",\"vat_rate\":0,\"effective_from\":\"2099-01-01\"}" $TOKEN)" 200
+FUTURE_ID=$(pyj "d['id']")
+get /api/v1/admin/fee-rates >/dev/null
+eq "liste: en yeni önce, geçerli olan işaretli" "$(pyj "'/'.join(f\"{i['rate_percent']}:{i['fixed_kurus']}:{i['current']}\" for i in d['items'])")" "3:25:False/2.49:0:True"
+eq "Türkiye gün başı (UTC 21:00)" "$(pyj "d['items'][1]['effective_from']")" "2025-12-31T21:00:00Z"
+get '/api/v1/admin/payments?q=fee1' >/dev/null
+eq "ödeme komisyonu: 299 TL × %2,49 + KDV = 8,94" "$(pyj "d['items'][0]['fee_kurus']")" "894"
+get '/api/v1/admin/payments?status=failed&limit=1' >/dev/null
+eq "başarısız ödemede komisyon yok" "$(pyj "d['items'][0]['fee_kurus']")" "None"
+eq "çok baytlı uzun arama panik yapmaz" "$(get "/api/v1/admin/payments?q=a$(printf '%%C5%%9F%.0s' $(seq 1 120))")" 200
+get /api/v1/admin/overview >/dev/null
+eq "özet: komisyon hesaplandı, oransız ödeme yok" "$(pyj "f\"{d['fee_30d_kurus'] >= 894}/{d['fee_30d_uncovered']}\"")" "True/0"
+eq "oran sil → 200" "$(post /api/v1/admin/fee-rates/$FUTURE_ID/delete "{$ACTI,\"note\":\"yanlış girildi\"}" $TOKEN)" 200
+eq "olmayan oranı sil → 400" "$(post /api/v1/admin/fee-rates/$FUTURE_ID/delete "{$ACTI}" $TOKEN)" 400
+eq "iz kaydı (sistem geneli)" "$(sql "SELECT string_agg(action||':'||member_id, ',' ORDER BY id) FROM admin_actions WHERE action LIKE 'fee_rate.%'")" "fee_rate.create:0,fee_rate.create:0,fee_rate.delete:0"
+
 echo "== Sonuç: $PASS geçti, $FAIL başarısız"
 [ "$FAIL" = 0 ]
