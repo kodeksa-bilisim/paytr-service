@@ -161,6 +161,18 @@ fn subscription_metadata(base: Option<serde_json::Value>, adj: &crate::growth::A
     (!m.is_empty()).then_some(serde_json::Value::Object(m))
 }
 
+/// Kuponun toplam kullanım sınırı: transaction içinde, üyenin eski bekleyen ödemesi iptal
+/// edildikten sonra çağrılır (bkz. `growth_repo::coupon_has_room`).
+async fn hold_coupon(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, adj: &crate::growth::Adjusted) -> Result<(), AppError> {
+    let Some(code) = adj.discount.as_ref().filter(|d| d.source == "coupon").and_then(|d| d.code.as_deref()) else {
+        return Ok(());
+    };
+    if !crate::db::growth_repo::coupon_has_room(tx, code).await? {
+        return Err(AppError::BadRequest("Bu indirim kodunun kullanım sınırı doldu.".to_string()));
+    }
+    Ok(())
+}
+
 /// PayTR `debug_on` yalnızca test modunda iletilir (canlıda hata ayrıntısı kullanıcıya gösterilmesin).
 fn debug_flag(state: &crate::AppData, requested: Option<u8>) -> Option<u8> {
     if state.config.test_mode == 1 { requested } else { None }
@@ -240,6 +252,7 @@ pub async fn init_payment(
     subscription_repo::cancel_pending(&mut *tx, member_id)
         .await
         .map_err(anyhow::Error::from)?;
+    hold_coupon(&mut tx, &adj).await?;
 
     // Pending abonelik: tutarı liste fiyatı (yenilemelerde çekilen).
     let subscription = subscription_repo::create(
@@ -396,6 +409,7 @@ pub async fn init_enterprise_payment(
     subscription_repo::cancel_pending(&mut *tx, member_id)
         .await
         .map_err(anyhow::Error::from)?;
+    hold_coupon(&mut tx, &adj).await?;
 
     let subscription = subscription_repo::create(
         &mut *tx,

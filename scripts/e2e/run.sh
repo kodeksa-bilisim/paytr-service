@@ -397,6 +397,17 @@ callback "$P20B" success 89900 >/dev/null
 eq "kupon pasifleştirilebilir" "$(post /api/v1/admin/coupons/yaz30/active '{"active":false}' $TOKEN)" 200
 get /api/v1/admin/coupons >/dev/null
 eq "kupon listesi" "$(pyj "f\"{d['items'][0]['code']}/{d['items'][0]['active']}/{d['items'][0]['redemptions']}\"")" "YAZ30/False/1"
+# Sınır, ödeme penceresi açık (bekleyen) kuponlu ödemeleri de sayar: aynı anda başlatılan
+# ödemeler sınırı aşamaz.
+sql "INSERT INTO customers (member_id,name,email,user_type) VALUES (60,'K60','k60@x.test','Standard'), (61,'K61','k61@x.test','Standard');"
+post /api/v1/admin/coupons '{"code":"TEK1","kind":"percent","value":"10","max_redemptions":1}' $TOKEN >/dev/null
+eq "tek kullanımlık kupon: ilk ödeme penceresi → 200" "$(post /api/v1/payments/init "$(gold_init 60 u60a ',"coupon_code":"TEK1"')" $TOKEN)" 200
+eq "başka üye aynı anda → 400 (yer tutuldu)" "$(post /api/v1/payments/init "$(gold_init 61 u61a ',"coupon_code":"TEK1"')" $TOKEN)" 400
+eq "aynı üye pencereyi yeniden açar → 200" "$(post /api/v1/payments/init "$(gold_init 60 u60b ',"coupon_code":"TEK1"')" $TOKEN)" 200
+sql "UPDATE paytr_payments SET created_at = created_at - interval '31 minutes' WHERE merchant_oid = 'u60b'"
+eq "30 dk sonra yarım kalan pencere yer tutmaz → 200" "$(post /api/v1/payments/init "$(gold_init 61 u61b ',"coupon_code":"TEK1"')" $TOKEN)" 200
+sql "UPDATE paytr_payments SET status='failed', failed_reason_msg='no_callback' WHERE merchant_oid IN ('u60a','u60b','u61b');
+     UPDATE paytr_subscriptions SET status='cancelled' WHERE member_id IN (60,61) AND status='pending';" >/dev/null
 
 echo "== Ücretsiz deneme (kartsız 7 gün Gold)"
 get /api/v1/members/24/growth >/dev/null

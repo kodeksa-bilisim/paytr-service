@@ -35,6 +35,34 @@ pub async fn member_redeemed(pool: &PgPool, code: &str, member_id: i32) -> Resul
         .await?)
 }
 
+/// Ödeme penceresinin açık kaldığı süre (PayTR iframe belirteci varsayılan 30 dk geçerli).
+const COUPON_HOLD_MINUTES: i32 = 30;
+
+/// Toplam kullanım sınırı olan kuponda yer var mı? Kullanım ödeme başarılı olunca yazıldığı için
+/// son 30 dakikada başlatılmış, hâlâ bekleyen kuponlu ödemeler de yer tutar; kupon satırı
+/// transaction sonuna kadar kilitlenir (eşzamanlı başlatmalar sırayla sayılır). Çağıran, üyenin
+/// eski bekleyen aboneliklerini önce iptal etmiş olmalı (yeniden açılan pencere iki kez sayılmasın).
+pub async fn coupon_has_room(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, code: &str) -> Result<bool> {
+    let row: Option<(Option<i32>, i32)> =
+        sqlx::query_as("SELECT max_redemptions, redemptions FROM coupons WHERE code = $1 FOR UPDATE")
+            .bind(code)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some((Some(max), used)) = row else { return Ok(true) };
+    let held: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM paytr_subscriptions s
+         JOIN paytr_payments p ON p.subscription_id = s.id
+         WHERE s.status = 'pending' AND p.status = 'pending'
+           AND s.metadata->'discount'->>'code' = $1
+           AND p.created_at > NOW() - make_interval(mins => $2)",
+    )
+    .bind(code)
+    .bind(COUPON_HOLD_MINUTES)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok((used as i64) + held < max as i64)
+}
+
 /// İlk ödeme başarılı: kullanım yazılır ve sayaç artar (aynı ödeme/üye için bir kez).
 pub async fn record_redemption<'c>(
     tx: &mut sqlx::Transaction<'c, sqlx::Postgres>,
