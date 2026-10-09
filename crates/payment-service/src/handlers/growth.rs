@@ -55,8 +55,8 @@ pub struct TrialRequest {
     email: String,
 }
 
-/// POST /api/v1/trials/start — kartsız 7 gün Gold; hiç aboneliği/denemesi olmamış üyeye bir kez.
-/// E-posta doğrulaması Next.js'te kontrol edilir.
+/// POST /api/v1/trials/start — kartsız 7 gün Gold; hiç aboneliği/denemesi olmamış üyeye ve posta
+/// kutusuna bir kez. E-posta doğrulaması Next.js'te de, burada da kontrol edilir.
 pub async fn start_trial(State(state): State<AppState>, Json(req): Json<TrialRequest>) -> Result<Json<Value>, AppError> {
     if req.member_id <= 0 {
         return Err(AppError::BadRequest("Geçersiz member_id".into()));
@@ -67,15 +67,22 @@ pub async fn start_trial(State(state): State<AppState>, Json(req): Json<TrialReq
 
     let mut tx = state.db.begin().await.map_err(anyhow::Error::from)?;
     subscription_repo::lock_member(&mut *tx, req.member_id).await?;
-    let eligible: bool = sqlx::query_scalar(&format!(
-        "SELECT NOT EXISTS(SELECT 1 FROM paytr_subscriptions WHERE {})
-            AND EXISTS(SELECT 1 FROM customers WHERE member_id = $1)",
-        subscription_repo::TRIAL_CONSUMING
-    ))
-    .bind(req.member_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(anyhow::Error::from)?;
+    // Doğrulanmamış e-posta (yalnızca e-postayla kayıtta `false`; OAuth/eski hesap NULL) deneme açamaz.
+    let verified: Option<bool> = sqlx::query_scalar("SELECT email_verified IS NOT FALSE FROM customers WHERE member_id = $1")
+        .bind(req.member_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?;
+    match verified {
+        None => return Err(AppError::BadRequest("Üye bulunamadı.".into())),
+        Some(false) => return Err(AppError::BadRequest("Ücretsiz deneme için önce e-posta adresinizi doğrulayın.".into())),
+        Some(true) => {}
+    }
+    let eligible: bool = sqlx::query_scalar(&format!("SELECT {}", subscription_repo::trial_eligible_sql()))
+        .bind(req.member_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?;
     if !eligible {
         return Err(AppError::BadRequest("Ücretsiz deneme yalnızca daha önce abonelik ya da deneme kullanmamış hesaplarda geçerlidir.".into()));
     }

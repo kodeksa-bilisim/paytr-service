@@ -410,6 +410,7 @@ sql "UPDATE paytr_payments SET status='failed', failed_reason_msg='no_callback' 
      UPDATE paytr_subscriptions SET status='cancelled' WHERE member_id IN (60,61) AND status='pending';" >/dev/null
 
 echo "== Ücretsiz deneme (kartsız 7 gün Gold)"
+sql "UPDATE customers SET email_verified=true WHERE member_id IN (20,24)" >/dev/null
 get /api/v1/members/24/growth >/dev/null
 eq "deneme hakkı var" "$(pyj "d['trial']['eligible']")" True
 eq "deneme başladı" "$(post /api/v1/trials/start '{"member_id":24,"email":"k24@x.test"}' $TOKEN)" 200
@@ -427,6 +428,18 @@ tick
 eq "süresi dolunca ek süresiz Standard" "$(sql "SELECT s.status||'/'||c.user_type FROM paytr_subscriptions s JOIN customers c USING (member_id) WHERE s.id=$TRIAL24")" "expired/Standard"
 eq "denemede tahsilat denenmedi" "$(sql "SELECT count(*) FROM paytr_payments WHERE member_id=24")" 0
 eq "deneme bitti, hak yok" "$(get /api/v1/members/24/growth >/dev/null; pyj "d['trial']['eligible']")" False
+
+echo "== Deneme kötüye kullanımı (aynı posta kutusu, doğrulanmamış e-posta)"
+sql "INSERT INTO customers (member_id,name,email,user_type,email_verified) VALUES
+ (62,'K62','k62@x.test','Standard',false), (63,'K63','K24+yeni@X.test','Standard',true),
+ (64,'K64','Ali.Veli@gmail.com','Standard',true), (65,'K65','aliveli+promo@googlemail.com','Standard',true),
+ (66,'K66','k66@x.test','Standard',true);" >/dev/null
+eq "doğrulanmamış e-posta → 400" "$(post /api/v1/trials/start '{"member_id":62,"email":"k62@x.test"}' $TOKEN)" 400
+eq "+ekli takma ad: hak yok" "$(get /api/v1/members/63/growth >/dev/null; pyj "d['trial']['eligible']")" False
+eq "+ekli takma ad → 400" "$(post /api/v1/trials/start '{"member_id":63,"email":"K24+yeni@X.test"}' $TOKEN)" 400
+eq "gmail: ilk hesap deneme alır" "$(post /api/v1/trials/start '{"member_id":64,"email":"Ali.Veli@gmail.com"}' $TOKEN)" 200
+eq "gmail: nokta/+ek/googlemail → 400" "$(post /api/v1/trials/start '{"member_id":65,"email":"aliveli+promo@googlemail.com"}' $TOKEN)" 400
+eq "ilgisiz hesap etkilenmez" "$(get /api/v1/members/66/growth >/dev/null; pyj "d['trial']['eligible']")" True
 
 echo "== Referans (davetliye ilk ödemede %20, davet edene 14 gün sonra 1 ay)"
 get /api/v1/members/22/growth >/dev/null

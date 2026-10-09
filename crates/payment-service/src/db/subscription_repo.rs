@@ -474,9 +474,39 @@ pub async fn create_trial<'e>(
 pub const TRIAL_CONSUMING: &str =
     "member_id = $1 AND started_at IS NOT NULL AND NOT COALESCE((metadata->>'trial_voided')::boolean, false)";
 
-/// Deneme hakkı: hiç başlamış (ödemeli ya da deneme) aboneliği olmayan üye.
+/// E-postanın posta kutusu anahtarı (SQL ifadesi): küçük harf, `+ek` atılır; gmail'de noktalar da.
+/// Aynı kutunun takma adlarıyla (`ad+1@`, `a.d@gmail.com`) yeni hesap açıp tekrar deneme alınmasın.
+pub fn email_key_sql(col: &str) -> String {
+    let e = format!("lower(trim(COALESCE({col}, '')))");
+    format!(
+        "(CASE WHEN split_part({e}, '@', 2) IN ('gmail.com', 'googlemail.com') \
+         THEN replace(split_part(split_part({e}, '@', 1), '+', 1), '.', '') || '@gmail.com' \
+         ELSE split_part(split_part({e}, '@', 1), '+', 1) || '@' || split_part({e}, '@', 2) END)"
+    )
+}
+
+/// Deneme hakkı koşulu ($1 = member_id): üyenin başlamış aboneliği yok ve aynı posta kutusuyla
+/// başka bir hesapta deneme kullanılmamış (aboneliğe yazılan e-posta hesap silinse de kalır).
+pub fn trial_eligible_sql() -> String {
+    format!(
+        "NOT EXISTS(SELECT 1 FROM paytr_subscriptions WHERE {TRIAL_CONSUMING})
+         AND NOT EXISTS(
+             SELECT 1 FROM paytr_subscriptions s JOIN customers c ON c.member_id = $1
+             WHERE s.member_id <> $1
+               AND COALESCE((s.metadata->>'trial')::boolean, false)
+               AND s.started_at IS NOT NULL
+               AND NOT COALESCE((s.metadata->>'trial_voided')::boolean, false)
+               AND split_part(c.email, '@', 2) <> ''
+               AND {} = {})",
+        email_key_sql("s.user_email"),
+        email_key_sql("c.email"),
+    )
+}
+
+/// Deneme hakkı: hiç başlamış (ödemeli ya da deneme) aboneliği olmayan ve posta kutusu daha önce
+/// deneme kullanmamış üye.
 pub async fn trial_eligible(pool: &PgPool, member_id: i32) -> Result<bool> {
-    Ok(sqlx::query_scalar(&format!("SELECT NOT EXISTS(SELECT 1 FROM paytr_subscriptions WHERE {TRIAL_CONSUMING})"))
+    Ok(sqlx::query_scalar(&format!("SELECT {}", trial_eligible_sql()))
         .bind(member_id)
         .fetch_one(pool)
         .await?)
