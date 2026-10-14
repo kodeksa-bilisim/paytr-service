@@ -22,3 +22,4 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "ma
 chrono = { version = "0.4", features = ["serde"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-native-tls", "builder"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.37"

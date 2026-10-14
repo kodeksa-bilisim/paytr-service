@@ -3,14 +3,14 @@
 //! Her dakika: bekleyen kayıtları kirala → (önceki deneme varsa) ETTN ile durum sorgula →
 //! yoksa gönder → numarayı yaz. Geçici hatada üstel bekleme, kalıcı hatada ya da 8 denemede
 //! `failed` + yönetici e-postası. Kesilen faturaların GİB onayı 2 gün boyunca izlenir.
-//! GİB e-Fatura kullanıcı listesi günde bir yenilenir.
+//! Turkcell'de GİB e-Fatura kullanıcı listesi günde bir yenilenir; Uyumsoft alıcıyı anlık sorgular.
 
 use std::time::Duration;
 
 use chrono::Utc;
 
-use super::turkcell::{Client, TcError};
-use super::{model, repo, DocType};
+use super::provider::Client;
+use super::{model, repo, DocType, ProviderError};
 use crate::config::EinvoiceConfig;
 use crate::{email, email_templates, AppState};
 
@@ -18,7 +18,7 @@ const BATCH: i64 = 20;
 const MAX_ATTEMPTS: i32 = 8;
 const USERS_MAX_AGE_HOURS: i64 = 24;
 
-/// Turkcell durumları (e-Arşiv ve giden e-Fatura); onay (60) `repo::unconfirmed` sorgusunda.
+/// Ortak durum ölçeği (bkz. `Status`); onay (60) `repo::unconfirmed` sorgusunda.
 const ST_ERROR: i32 = 40;
 const ST_CANCELLED: i32 = 100;
 
@@ -54,7 +54,7 @@ fn env_secs(key: &str, default: u64) -> u64 {
 }
 
 fn client<'a>(state: &'a AppState, cfg: &'a EinvoiceConfig) -> Client<'a> {
-    Client { http: &state.http, base: &cfg.base_url, key: &cfg.api_key }
+    Client::new(&state.http, cfg)
 }
 
 pub async fn run_once(state: &AppState) {
@@ -68,7 +68,11 @@ pub async fn run_once(state: &AppState) {
     }
 }
 
+/// Yalnız Turkcell: alıcı türü indirilen GİB listesinden belirlenir.
 async fn sync_users_if_stale(state: &AppState, cfg: &EinvoiceConfig) {
+    if !matches!(cfg.provider, crate::config::EinvoiceProvider::Turkcell { .. }) {
+        return;
+    }
     let fresh = match repo::users_synced_at(&state.db).await {
         Ok(Some(t)) => Utc::now().naive_utc() - t < chrono::Duration::hours(USERS_MAX_AGE_HOURS),
         Ok(None) => false,
@@ -80,7 +84,8 @@ async fn sync_users_if_stale(state: &AppState, cfg: &EinvoiceConfig) {
     if fresh {
         return;
     }
-    let bytes = match client(state, cfg).users_zip().await {
+    let Client::Turkcell(tc) = client(state, cfg) else { return };
+    let bytes = match tc.users_zip().await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!("e-Fatura kullanıcı listesi indirilemedi (eski liste kullanılıyor): {e}");
@@ -100,11 +105,20 @@ async fn sync_users_if_stale(state: &AppState, cfg: &EinvoiceConfig) {
     }
 }
 
-/// Alıcı GİB e-Fatura kullanıcısıysa e-Fatura (posta kutusuyla), değilse e-Arşiv.
-async fn decide(state: &AppState, buyer: &serde_json::Value) -> anyhow::Result<(DocType, Option<String>)> {
-    if let Some(id) = super::buyer_identifier(buyer) {
-        if let Some(alias) = repo::einvoice_alias(&state.db, &id).await? {
-            return Ok((DocType::Efatura, Some(alias)));
+/// Alıcı GİB e-Fatura kullanıcısıysa e-Fatura, değilse e-Arşiv. Turkcell'de posta kutusu
+/// listeden gelir; Uyumsoft'ta verilmez (alıcının varsayılan kutusu).
+async fn decide(state: &AppState, tc: &Client<'_>, buyer: &serde_json::Value) -> anyhow::Result<(DocType, Option<String>)> {
+    let Some(id) = super::buyer_identifier(buyer) else { return Ok((DocType::Earchive, None)) };
+    match tc {
+        Client::Uyumsoft(c) => {
+            if c.is_einvoice_user(&id).await? {
+                return Ok((DocType::Efatura, None));
+            }
+        }
+        Client::Turkcell(_) => {
+            if let Some(alias) = repo::einvoice_alias(&state.db, &id).await? {
+                return Ok((DocType::Efatura, Some(alias)));
+            }
         }
     }
     Ok((DocType::Earchive, None))
@@ -124,12 +138,12 @@ async fn issue_one(state: &AppState, cfg: &EinvoiceConfig, inv: &repo::Claimed) 
 
     // Belge türü ilk denemede sabitlenir.
     let (doc, alias) = match inv.doc_type.as_deref().and_then(DocType::parse) {
-        Some(DocType::Efatura) => match super::buyer_identifier(&inv.buyer) {
-            Some(id) => (DocType::Efatura, repo::einvoice_alias(&state.db, &id).await.ok().flatten()),
-            None => (DocType::Efatura, None),
+        Some(DocType::Efatura) => match (&tc, super::buyer_identifier(&inv.buyer)) {
+            (Client::Turkcell(_), Some(id)) => (DocType::Efatura, repo::einvoice_alias(&state.db, &id).await.ok().flatten()),
+            _ => (DocType::Efatura, None),
         },
         Some(d) => (d, None),
-        None => match decide(state, &inv.buyer).await {
+        None => match decide(state, &tc, &inv.buyer).await {
             Ok((d, a)) => {
                 if let Err(e) = repo::set_doc_type(&state.db, inv.id, d.as_str()).await {
                     tracing::error!(invoice = inv.id, "Belge türü yazılamadı: {:?}", e);
@@ -143,19 +157,19 @@ async fn issue_one(state: &AppState, cfg: &EinvoiceConfig, inv: &repo::Claimed) 
             }
         },
     };
-    if doc == DocType::Efatura && alias.is_none() {
+    if doc == DocType::Efatura && alias.is_none() && matches!(tc, Client::Turkcell(_)) {
         fail(state, inv, "e-Fatura alıcısının posta kutusu bulunamadı (GİB listesi)", None).await;
         return;
     }
 
-    // Önceki deneme gönderilmiş olabilir: aynı ETTN Turkcell'de varsa yeniden gönderilmez.
+    // Önceki deneme gönderilmiş olabilir: aynı ETTN entegratörde varsa yeniden gönderilmez.
     if inv.prior_attempts > 0 {
         match tc.status(doc, &inv.ettn).await {
             Ok(st) => {
-                settle(state, inv, st.status, st.invoice_number.as_deref(), st.message.as_deref()).await;
+                settle(state, cfg, inv, st.status, st.invoice_number.as_deref(), st.message.as_deref()).await;
                 return;
             }
-            Err(TcError::NotFound) => {}
+            Err(ProviderError::NotFound) => {}
             Err(e) => {
                 retry_or_fail(state, inv, attempt, &e.to_string()).await;
                 return;
@@ -164,8 +178,7 @@ async fn issue_one(state: &AppState, cfg: &EinvoiceConfig, inv: &repo::Claimed) 
     }
 
     let line_name = inv.lines.get(0).and_then(|l| l.get("name")).and_then(|v| v.as_str()).unwrap_or("nlink hizmet bedeli");
-    let body = model::build(
-        &model::Input {
+    let input = model::Input {
             merchant_oid: &inv.merchant_oid,
             ettn: &inv.ettn,
             doc,
@@ -176,12 +189,10 @@ async fn issue_one(state: &AppState, cfg: &EinvoiceConfig, inv: &repo::Claimed) 
             net_kurus: inv.net_kurus,
             vat_kurus: inv.vat_kurus,
             paid_at: inv.created_at,
-        },
-        cfg,
-    );
-    match tc.create(doc, &body).await {
+    };
+    match tc.create(&input, cfg).await {
         Ok(c) => {
-            if let Err(e) = repo::mark_issued(&state.db, inv.id, Some(&c.invoice_number), None).await {
+            if let Err(e) = repo::mark_issued(&state.db, inv.id, cfg.provider.name(), Some(&c.invoice_number), None).await {
                 // Fatura kesildi ama yazılamadı: kayıt kirada kalır, sonraki deneme durumdan bulur.
                 tracing::error!(invoice = inv.id, ettn = %inv.ettn, "Kesilen fatura kaydedilemedi: {:?}", e);
                 return;
@@ -190,7 +201,7 @@ async fn issue_one(state: &AppState, cfg: &EinvoiceConfig, inv: &repo::Claimed) 
         }
         // Aynı ETTN zaten var (önceki gönderim yazılamamış): durumdan tamamlanır.
         Err(e) if e.is_duplicate_ettn() => match tc.status(doc, &inv.ettn).await {
-            Ok(st) => settle(state, inv, st.status, st.invoice_number.as_deref(), st.message.as_deref()).await,
+            Ok(st) => settle(state, cfg, inv, st.status, st.invoice_number.as_deref(), st.message.as_deref()).await,
             Err(e2) => retry_or_fail(state, inv, attempt, &e2.to_string()).await,
         },
         Err(e) if e.is_permanent() => fail(state, inv, &e.to_string(), None).await,
@@ -198,15 +209,15 @@ async fn issue_one(state: &AppState, cfg: &EinvoiceConfig, inv: &repo::Claimed) 
     }
 }
 
-/// Turkcell'deki duruma göre kaydı kapatır.
-async fn settle(state: &AppState, inv: &repo::Claimed, status: i32, number: Option<&str>, message: Option<&str>) {
+/// Entegratördeki duruma göre kaydı kapatır.
+async fn settle(state: &AppState, cfg: &EinvoiceConfig, inv: &repo::Claimed, status: i32, number: Option<&str>, message: Option<&str>) {
     let r = match status {
         ST_ERROR => {
-            fail(state, inv, &format!("Turkcell/GİB hatası: {}", message.unwrap_or("-")), Some(status)).await;
+            fail(state, inv, &format!("Entegratör/GİB hatası: {}", message.unwrap_or("-")), Some(status)).await;
             return;
         }
         ST_CANCELLED => repo::mark_cancelled(&state.db, inv.id).await,
-        s => repo::mark_issued(&state.db, inv.id, number, Some(s)).await,
+        s => repo::mark_issued(&state.db, inv.id, cfg.provider.name(), number, Some(s)).await,
     };
     if let Err(e) = r {
         tracing::error!(invoice = inv.id, "Fatura durumu yazılamadı: {:?}", e);
@@ -255,7 +266,7 @@ async fn alert(state: &AppState, reason: &str, details: Vec<(&str, String)>) {
 /// Kesilen faturaların GİB sonucunu izler (onay 60, hata 40, iptal 100).
 async fn follow_up(state: &AppState, cfg: &EinvoiceConfig) -> anyhow::Result<()> {
     let tc = client(state, cfg);
-    for u in repo::unconfirmed(&state.db, 50).await? {
+    for u in repo::unconfirmed(&state.db, cfg.provider.name(), 50).await? {
         let Some(doc) = DocType::parse(&u.doc_type) else { continue };
         match tc.status(doc, &u.ettn).await {
             Ok(st) if st.status == ST_ERROR => {

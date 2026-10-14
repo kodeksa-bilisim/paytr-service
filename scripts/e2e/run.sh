@@ -28,6 +28,7 @@ cleanup() {
   [ -n "${SVC_PID:-}" ] && kill "$SVC_PID" 2>/dev/null
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null
   [ -n "${TC_PID:-}" ] && kill "$TC_PID" 2>/dev/null
+  [ -n "${UY_PID:-}" ] && kill "$UY_PID" 2>/dev/null
   docker rm -f $PG >/dev/null 2>&1
   [ "$FAIL" = 0 ] && rm -rf "$WORK" || echo "Loglar: $WORK"
 }
@@ -541,7 +542,7 @@ inv ein7 46 '{"type":"corporate","title":"Liste Dışı A.Ş.","tax_number":"111
     BASE_URL=$BASE SCHEDULER_INTERVAL_SECS=3600 SCHEDULER_START_DELAY_SECS=3600 GRACE_DAYS=4 \
     MAX_FAILED_ATTEMPTS=3 INTERNAL_API_TOKEN=$TOKEN PAYTR_BASE_URL=http://127.0.0.1:$MOCK_PORT \
     INVOICE_EXEMPT_MEMBERS=12 \
-    EINVOICE_ENABLED=1 TURKCELL_EFATURA_BASE_URL=http://127.0.0.1:$TC_PORT TURKCELL_EFATURA_API_KEY=tc-test-key \
+    EINVOICE_ENABLED=1 EINVOICE_PROVIDER=turkcell TURKCELL_EFATURA_BASE_URL=http://127.0.0.1:$TC_PORT TURKCELL_EFATURA_API_KEY=tc-test-key \
     EINVOICE_INTERVAL_SECS=2 EINVOICE_START_DELAY_SECS=1 \
     RUST_LOG=payment_service=debug "$ROOT/target/debug/payment-service" >> "$SVC_LOG" 2>&1 ) & SVC_PID=$!
 for _ in $(seq 1 30); do curl -s "$BASE/health" >/dev/null && break; sleep 1; done
@@ -591,6 +592,65 @@ eq "elle kesildi + numara" "$(sql "SELECT status||'/'||invoice_no FROM invoices 
 eq "kesilmiş fatura elle kapatılamaz → 400" "$(post /api/v1/admin/invoices/$ID1/manual "{$ACTI}" $TOKEN)" 400
 eq "iz kaydı" "$(sql "SELECT string_agg(action, ',' ORDER BY id) FROM admin_actions WHERE action LIKE 'invoice.%'")" "invoice.retry,invoice.manual"
 kill "$TC_PID" 2>/dev/null
+
+echo "== e-Fatura / e-Arşiv kesimi (sahte Uyumsoft, SOAP)"
+UY_PORT=38082
+UY_LOG=$WORK/uyumsoft.log
+python3 "$HERE/mock_uyumsoft.py" $UY_PORT "$UY_LOG" & UY_PID=$!
+pkill -f "$ROOT/target/debug/payment-service" 2>/dev/null
+for _ in $(seq 1 30); do curl -s -o /dev/null "$BASE/health" || break; sleep 0.5; done
+sql "UPDATE invoices SET status='manual' WHERE status='pending' AND source IS DISTINCT FROM 'backfill';" >/dev/null
+inv uy1 50 '{"type":"individual","name":"Ayşe Yılmaz","email":"ayse@x.test"}' 24917 4983
+inv uy2 51 '{"type":"corporate","title":"Test Kurum İki","tax_number":"1234567802","tax_office":"Kadıköy","address":"Örnek Mah. 1","city":"İstanbul","district":"Kadıköy","country":"Türkiye","email":"k@x.test"}' 24917 4983
+inv uy3 52 '{"type":"individual","name":"Hata422 Test","email":"h@x.test"}' 24917 4983
+inv uy4 53 '{"type":"individual","name":"Gecici Test","email":"g@x.test"}' 88 17
+inv uy5 54 '{"type":"individual","name":"DusenYanit Test","email":"d@x.test"}' 24917 4983
+inv uy7 56 '{"type":"corporate","title":"Liste Dışı A.Ş.","tax_number":"1111111112","tax_office":"Şişli","address":"Örnek 2","city":"İstanbul","district":"Şişli","country":"Türkiye"}' 24917 4983
+
+uysvc() { # ek ortam değişkenleri
+  ( cd "$WORK" && env -i PATH="$PATH"     DATABASE_URL="postgres://postgres:pw@127.0.0.1:$PGPORT/postgres"     MERCHANT_ID=m1 MERCHANT_KEY=$KEY MERCHANT_SALT=$SALT HOST=127.0.0.1 PORT=$SVC_PORT TEST_MODE=0     BASE_URL=$BASE SCHEDULER_INTERVAL_SECS=3600 SCHEDULER_START_DELAY_SECS=3600 GRACE_DAYS=4     MAX_FAILED_ATTEMPTS=3 INTERNAL_API_TOKEN=$TOKEN PAYTR_BASE_URL=http://127.0.0.1:$MOCK_PORT     INVOICE_EXEMPT_MEMBERS=12     EINVOICE_ENABLED=1 EINVOICE_PROVIDER=uyumsoft UYUMSOFT_URL=http://127.0.0.1:$UY_PORT/Services/Integration     UYUMSOFT_USERNAME=uy-user UYUMSOFT_PASSWORD=uy-pass     EINVOICE_SELLER_VKN=1234567890 EINVOICE_SELLER_TITLE="Örnek Bilişim A.Ş." EINVOICE_SELLER_TAX_OFFICE=Kadıköy     EINVOICE_SELLER_STREET="Örnek Mah. 1" EINVOICE_SELLER_DISTRICT=Kadıköy EINVOICE_SELLER_CITY=İstanbul     EINVOICE_INTERVAL_SECS=2 EINVOICE_START_DELAY_SECS=1 "$@"     RUST_LOG=payment_service=debug "$ROOT/target/debug/payment-service" >> "$SVC_LOG" 2>&1 ) & SVC_PID=$!
+  for _ in $(seq 1 30); do curl -s "$BASE/health" >/dev/null && break; sleep 1; done
+}
+uysvc
+sleep 6
+uyreq() { python3 -c "
+import json,sys
+for l in open('$UY_LOG'):
+    r=json.loads(l)
+    if r.get('op')=='SendInvoice' and r.get('local')=='$1': print(eval(sys.argv[1])); break
+" "$2"; }
+eq "bireysel → e-Arşiv kesildi (Uyumsoft)" "$(istate uy1)" "issued/earchive/uyumsoft"
+eq "fatura no + ETTN yazıldı" "$(sql "SELECT (invoice_no LIKE 'NLK2026%')::text||'/'||(provider_ref = ettn::text)::text FROM invoices WHERE merchant_oid='uy1'")" "true/true"
+eq "UBL: UUID = ETTN" "$(uyreq uy1 "r['uuid']")" "$(sql "SELECT ettn FROM invoices WHERE merchant_oid='uy1'")"
+eq "e-Arşiv UBL: profil, senaryo, tutarlar, nihai tüketici, satıcı, internet satışı, e-posta" "$(uyreq uy1 "f\"{r['profile']}/{r['scenario']}/{r['net']}/{r['vat']}/{r['payable']}/{r['customer_id']}/{r['supplier_id']}/{r['internet_sale']}/{r['mail_to']}\"")" "EARSIVFATURA/eArchive/249.17/49.83/299.00/11111111111/1234567890/True/ayse@x.test"
+eq "e-Fatura kullanıcısı kurumsal → e-Fatura (temel)" "$(istate uy2)/$(uyreq uy2 "f\"{r['profile']}/{r['scenario']}/{r['internet_sale']}/{r['mail_to']}\"")" "issued/efatura/uyumsoft/TEMELFATURA/eInvoice/False/None"
+eq "e-Fatura kullanıcısı olmayan kurumsal → e-Arşiv, VKN ile" "$(istate uy7)/$(uyreq uy7 "r['customer_id']")" "issued/earchive/uyumsoft/1111111112"
+eq "ret → kalıcı hata" "$(sql "SELECT status||'/'||(last_error LIKE '%reddetti%')::text FROM invoices WHERE merchant_oid='uy3'")" "failed/true"
+eq "SOAP hatası → beklemede" "$(sql "SELECT status||'/'||attempts FROM invoices WHERE merchant_oid='uy4'")" "pending/1"
+eq "gönderildi ama yanıt düştü → beklemede" "$(sql "SELECT status FROM invoices WHERE merchant_oid='uy5'")" "pending"
+sql "UPDATE invoices SET next_attempt_at = NULL WHERE merchant_oid IN ('uy4','uy5');" >/dev/null
+sleep 5
+eq "geçici hatadan sonra kesildi" "$(istate uy4)" "issued/earchive/uyumsoft"
+eq "1,05 TL: KDV 0,17, toplam 1,05" "$(python3 -c "
+import json
+r=[json.loads(l) for l in open('$UY_LOG') if json.loads(l).get('local')=='uy4'][-1]
+print(r['vat']+'/'+r['payable'])")" "0.17/1.05"
+eq "yanıtı düşen fatura: durumdan tamamlandı, onaylı (60)" "$(istate uy5)/$(sql "SELECT provider_status FROM invoices WHERE merchant_oid='uy5'")" "issued/earchive/uyumsoft/60"
+eq "yanıtı düşen fatura: ikinci kez gönderilmedi" "$(grep -c '"local": "uy5"' "$UY_LOG")" "1"
+UID1=$(sql "SELECT id FROM invoices WHERE merchant_oid='uy1'")
+H=$(curl -s -D - -o "$WORK/u.pdf" -H "X-Internal-Token: $TOKEN" "$BASE/api/v1/invoices/$UID1/pdf?member_id=50" | tr -d '' | grep -i '^content-type' | cut -d' ' -f2)
+eq "PDF (Uyumsoft, base64 çözüldü) → application/pdf" "$H/$(head -c 4 "$WORK/u.pdf")" "application/pdf/%PDF"
+eq "Turkcell'de kesilen faturanın PDF'i Uyumsoft'tayken → 503" "$(get "/api/v1/invoices/$ID1/pdf?member_id=40")" 503
+eq "Turkcell faturaları Uyumsoft'ta sorgulanmaz" "$(grep -c "$(sql "SELECT ettn FROM invoices WHERE merchant_oid='ein1'")" "$UY_LOG")" "0"
+
+echo "-- yanlış şifre: yetki hatası kalıcı"
+pkill -f "$ROOT/target/debug/payment-service" 2>/dev/null
+for _ in $(seq 1 30); do curl -s -o /dev/null "$BASE/health" || break; sleep 0.5; done
+inv uy8 57 '{"type":"individual","name":"Sifre Test","email":"s@x.test"}' 24917 4983
+uysvc UYUMSOFT_PASSWORD=yanlis
+sleep 5
+eq "yanlış şifre → failed, yetki hatası" "$(sql "SELECT status||'/'||(last_error LIKE '%yetki%')::text FROM invoices WHERE merchant_oid='uy8'")" "failed/true"
+kill "$UY_PID" 2>/dev/null
 
 echo "== Komisyon oranları (yönetici)"
 sql "INSERT INTO paytr_payments(member_id,merchant_oid,amount,status,callback_received_at,created_at) VALUES (3,'fee1','299.00','success',$UTC,$UTC)"

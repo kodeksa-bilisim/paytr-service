@@ -13,12 +13,47 @@ pub struct EmailConfig {
     pub site_url: String,
 }
 
-/// e-Arşiv / e-Fatura entegratörü (Turkcell e-Şirket). Tanımlı değilse faturalar `pending` kalır.
+/// e-Arşiv / e-Fatura entegratörü (`EINVOICE_PROVIDER`, varsayılan Uyumsoft).
+#[derive(Clone)]
+pub enum EinvoiceProvider {
+    /// Uyumsoft e-Dönüşüm SOAP servisi (WS-Security kullanıcı adı + şifre).
+    Uyumsoft { url: String, username: String, password: String },
+    /// Turkcell e-Şirket REST (`x-api-key`); yedek.
+    Turkcell { base_url: String, api_key: String },
+}
+
+impl EinvoiceProvider {
+    /// `invoices.provider` sütununa yazılan ad.
+    pub fn name(&self) -> &'static str {
+        match self {
+            EinvoiceProvider::Uyumsoft { .. } => "uyumsoft",
+            EinvoiceProvider::Turkcell { .. } => "turkcell",
+        }
+    }
+}
+
+/// Faturayı kesen firma (UBL'de satıcı). Turkcell bunu hesaptan doldurur; Uyumsoft'a UBL ile
+/// biz göndeririz.
+#[derive(Debug, Clone)]
+pub struct Seller {
+    /// 10 haneli VKN ya da (şahıs şirketinde) 11 haneli TCKN.
+    pub vkn: String,
+    pub title: String,
+    pub tax_office: String,
+    pub street: String,
+    pub district: String,
+    pub city: String,
+    pub postal_zone: Option<String>,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub mersis: Option<String>,
+    pub trade_registry: Option<String>,
+}
+
+/// Tanımlı değilse faturalar `pending` kalır.
 #[derive(Clone)]
 pub struct EinvoiceConfig {
-    /// `https://efaturaservicetest.isim360.com` (test) ya da `https://efaturaservice.turkcellesirket.com`.
-    pub base_url: String,
-    pub api_key: String,
+    pub provider: EinvoiceProvider,
     /// Bu tarihten (UTC) önce açılan kayıtlar otomatik kesilmez (e-belge geçişinden önceki ödemeler).
     pub start_at: Option<chrono::NaiveDateTime>,
     /// e-Arşiv internet satışında zorunlu taşıyıcı bilgisi (dijital hizmet: yer tutucu).
@@ -28,32 +63,80 @@ pub struct EinvoiceConfig {
     pub website: String,
     /// Birden çok seri varsa fatura numarası ön eki (ör. `NLK`); boşsa entegratörün varsayılanı.
     pub prefix: Option<String>,
+    /// Uyumsoft'ta zorunlu, Turkcell'de kullanılmaz.
+    pub seller: Option<Seller>,
 }
 
 impl std::fmt::Debug for EinvoiceConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let endpoint = match &self.provider {
+            EinvoiceProvider::Uyumsoft { url, .. } => url,
+            EinvoiceProvider::Turkcell { base_url, .. } => base_url,
+        };
         f.debug_struct("EinvoiceConfig")
-            .field("base_url", &self.base_url)
-            .field("api_key", &"[REDACTED]")
+            .field("provider", &self.provider.name())
+            .field("endpoint", endpoint)
+            .field("credentials", &"[REDACTED]")
             .field("start_at", &self.start_at)
             .field("prefix", &self.prefix)
+            .field("seller", &self.seller.as_ref().map(|s| &s.vkn))
             .finish()
     }
 }
 
-/// `EINVOICE_ENABLED=1` ve Turkcell adresi + anahtarı tanımlıysa Some.
+/// Yerel adres yalnızca uçtan uca testlerdeki sahte sunucu için.
+fn ensure_https(key: &str, url: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(url.starts_with("https://") || url.starts_with("http://127.0.0.1:"), "{key} https olmalı");
+    Ok(())
+}
+
+fn build_seller(var: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Seller> {
+    let req = |k: &str| var(k).with_context(|| format!("Uyumsoft için {k} gerekli (faturayı kesen firma)"));
+    let vkn = req("EINVOICE_SELLER_VKN")?;
+    anyhow::ensure!(
+        (vkn.len() == 10 || vkn.len() == 11) && vkn.bytes().all(|b| b.is_ascii_digit()),
+        "EINVOICE_SELLER_VKN 10 (VKN) ya da 11 (TCKN) haneli olmalı"
+    );
+    Ok(Seller {
+        vkn,
+        title: req("EINVOICE_SELLER_TITLE")?,
+        tax_office: req("EINVOICE_SELLER_TAX_OFFICE")?,
+        street: req("EINVOICE_SELLER_STREET")?,
+        district: req("EINVOICE_SELLER_DISTRICT")?,
+        city: req("EINVOICE_SELLER_CITY")?,
+        postal_zone: var("EINVOICE_SELLER_POSTAL_ZONE"),
+        email: var("EINVOICE_SELLER_EMAIL"),
+        phone: var("EINVOICE_SELLER_PHONE"),
+        mersis: var("EINVOICE_SELLER_MERSIS"),
+        trade_registry: var("EINVOICE_SELLER_TRADE_REGISTRY"),
+    })
+}
+
+/// `EINVOICE_ENABLED=1` ve seçilen entegratörün bilgileri tanımlıysa Some.
 fn build_einvoice_config() -> anyhow::Result<Option<EinvoiceConfig>> {
     let var = |k: &str| std::env::var(k).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     if var("EINVOICE_ENABLED").as_deref() != Some("1") {
         return Ok(None);
     }
-    let base_url = var("TURKCELL_EFATURA_BASE_URL").context("EINVOICE_ENABLED=1 ama TURKCELL_EFATURA_BASE_URL eksik")?;
-    // Yerel adres yalnızca uçtan uca testlerdeki sahte sunucu için.
-    anyhow::ensure!(
-        base_url.starts_with("https://") || base_url.starts_with("http://127.0.0.1:"),
-        "TURKCELL_EFATURA_BASE_URL https olmalı"
-    );
-    let api_key = var("TURKCELL_EFATURA_API_KEY").context("EINVOICE_ENABLED=1 ama TURKCELL_EFATURA_API_KEY eksik")?;
+    let (provider, seller) = match var("EINVOICE_PROVIDER").as_deref().unwrap_or("uyumsoft") {
+        "uyumsoft" => {
+            let url = var("UYUMSOFT_URL").context("EINVOICE_ENABLED=1 ama UYUMSOFT_URL eksik")?;
+            ensure_https("UYUMSOFT_URL", &url)?;
+            let provider = EinvoiceProvider::Uyumsoft {
+                url,
+                username: var("UYUMSOFT_USERNAME").context("EINVOICE_ENABLED=1 ama UYUMSOFT_USERNAME eksik")?,
+                password: var("UYUMSOFT_PASSWORD").context("EINVOICE_ENABLED=1 ama UYUMSOFT_PASSWORD eksik")?,
+            };
+            (provider, Some(build_seller(&var)?))
+        }
+        "turkcell" => {
+            let base_url = var("TURKCELL_EFATURA_BASE_URL").context("EINVOICE_ENABLED=1 ama TURKCELL_EFATURA_BASE_URL eksik")?;
+            ensure_https("TURKCELL_EFATURA_BASE_URL", &base_url)?;
+            let api_key = var("TURKCELL_EFATURA_API_KEY").context("EINVOICE_ENABLED=1 ama TURKCELL_EFATURA_API_KEY eksik")?;
+            (EinvoiceProvider::Turkcell { base_url: base_url.trim_end_matches('/').to_string(), api_key }, None)
+        }
+        other => anyhow::bail!("EINVOICE_PROVIDER '{other}' tanınmıyor (uyumsoft | turkcell)"),
+    };
     // Tarih Türkiye günü olarak verilir (ör. 2026-10-15) → o günün 00:00 TR = önceki gün 21:00 UTC.
     let start_at = match var("EINVOICE_START_DATE") {
         Some(d) => Some(
@@ -66,13 +149,13 @@ fn build_einvoice_config() -> anyhow::Result<Option<EinvoiceConfig>> {
         None => None,
     };
     Ok(Some(EinvoiceConfig {
-        base_url: base_url.trim_end_matches('/').to_string(),
-        api_key,
+        provider,
         start_at,
         shipment_id: var("EINVOICE_SHIPMENT_TCKNVKN").unwrap_or_else(|| "1111111111".into()),
         shipment_name: var("EINVOICE_SHIPMENT_NAME").unwrap_or_else(|| "Elektronik teslimat".into()),
         website: var("EINVOICE_WEBSITE").unwrap_or_else(|| "https://nlink.tr".into()),
         prefix: var("EINVOICE_PREFIX"),
+        seller,
     }))
 }
 

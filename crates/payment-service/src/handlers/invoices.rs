@@ -10,7 +10,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::einvoice::{repo, turkcell::Client, DocType};
+use crate::einvoice::{provider::Client, repo, DocType};
 use crate::error::AppError;
 use crate::handlers::admin_members::{audit, Actor};
 use crate::AppState;
@@ -31,16 +31,18 @@ pub struct PdfQuery {
     member_id: Option<i32>,
 }
 
-/// GET /api/v1/invoices/:id/pdf?member_id= — Turkcell'den PDF (aracı).
+/// GET /api/v1/invoices/:id/pdf?member_id= — faturayı kesen entegratörden PDF (aracı).
 pub async fn pdf(State(state): State<AppState>, Path(id): Path<i32>, Query(q): Query<PdfQuery>) -> Result<Response, AppError> {
-    let Some((owner, doc, ettn, number)) = repo::pdf_ref(&state.db, id).await? else { return Ok(not_found()) };
+    let Some((owner, doc, ettn, number, provider)) = repo::pdf_ref(&state.db, id).await? else { return Ok(not_found()) };
     if q.member_id.is_some_and(|m| m != owner) {
         return Ok(not_found());
     }
-    let (Some(cfg), Some(doc)) = (state.config.einvoice.as_ref(), DocType::parse(&doc)) else {
+    // Fatura başka entegratörde kesildiyse (entegratör değişti) PDF oradan alınamaz.
+    let cfg = state.config.einvoice.as_ref().filter(|c| c.provider.name() == provider);
+    let (Some(cfg), Some(doc)) = (cfg, DocType::parse(&doc)) else {
         return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "e-Fatura servisi kapalı" }))).into_response());
     };
-    let tc = Client { http: &state.http, base: &cfg.base_url, key: &cfg.api_key };
+    let tc = Client::new(&state.http, cfg);
     match tc.pdf(doc, &ettn).await {
         Ok(bytes) => {
             let name = format!("{}.pdf", number.unwrap_or_else(|| ettn.clone()));

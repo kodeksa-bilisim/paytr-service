@@ -40,7 +40,7 @@ const PAYMENT_SELECT: &str = r#"
            p.installment_count, p.callback_received_at, p.created_at,
            i.status AS invoice_status, i.invoice_no, i.pdf_url AS invoice_pdf_url,
            i.id AS invoice_id, i.last_error AS invoice_error, i.doc_type AS invoice_doc_type,
-           (i.status = 'issued' AND i.provider = 'turkcell' AND i.ettn IS NOT NULL) AS invoice_has_pdf
+           (i.status = 'issued' AND i.provider IN ('uyumsoft', 'turkcell') AND i.ettn IS NOT NULL) AS invoice_has_pdf
     FROM paytr_payments p
     LEFT JOIN customers cu ON cu.member_id = p.member_id
     LEFT JOIN paytr_subscriptions s ON s.id = p.subscription_id

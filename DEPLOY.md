@@ -220,19 +220,31 @@ bash deploy.sh --env
 - `GRACE_DAYS` (varsayılan 4), `MAX_FAILED_ATTEMPTS` (varsayılan 3): yenileme günde bir denenir,
   ödeme alınamayan abonelik bitişten `GRACE_DAYS` gün sonra expire edilir.
 - `.env` izinleri `600` olmalı (merchant key/salt içerir).
-- `EINVOICE_ENABLED=1` + `TURKCELL_EFATURA_BASE_URL` + `TURKCELL_EFATURA_API_KEY`: e-Arşiv / e-Fatura
-  kesimi (Turkcell e-Şirket). `EINVOICE_START_DATE` (TR günü) öncesi kayıtlar ve geriye dönük
-  (`source='backfill'`) kayıtlar otomatik kesilmez. Canlı ödemeler varken TEST adresini açmayın:
-  Turkcell faturayı alıcının e-postasına gönderir. Ayrıntı: aşağıdaki "e-Fatura" bölümü.
+- `EINVOICE_ENABLED=1`: e-Arşiv / e-Fatura kesimi. `EINVOICE_PROVIDER=uyumsoft` (varsayılan) için
+  `UYUMSOFT_URL`, `UYUMSOFT_USERNAME`, `UYUMSOFT_PASSWORD` ve satıcı bilgileri
+  (`EINVOICE_SELLER_VKN`, `_TITLE`, `_TAX_OFFICE`, `_STREET`, `_DISTRICT`, `_CITY`; isteğe bağlı
+  `_POSTAL_ZONE`, `_EMAIL`, `_PHONE`, `_MERSIS`, `_TRADE_REGISTRY`); `EINVOICE_PROVIDER=turkcell` için
+  `TURKCELL_EFATURA_BASE_URL` + `TURKCELL_EFATURA_API_KEY`. `EINVOICE_START_DATE` (TR günü) öncesi
+  kayıtlar ve geriye dönük (`source='backfill'`) kayıtlar otomatik kesilmez. Canlı ödemeler varken TEST
+  hesabını açmayın: entegratör faturayı alıcının e-postasına gönderir. Ayrıntı: aşağıdaki "e-Fatura" bölümü.
 
-### e-Fatura (Turkcell e-Şirket)
+### e-Fatura (Uyumsoft; Turkcell e-Şirket yedek)
 Ödeme callback'i `invoices` kaydını `pending` açar; arka plan görevi (`src/einvoice/worker.rs`)
-dakikada bir bekleyenleri keser. Alıcının VKN/TCKN'si GİB e-Fatura listesindeyse e-Fatura (temel
-senaryo, posta kutusu listeden), değilse e-Arşiv (Turkcell müşteriye e-posta gönderir). Liste günde
-bir `einvoice_users` tablosuna indirilir.
+dakikada bir bekleyenleri keser. Alıcının VKN/TCKN'si GİB e-Fatura kullanıcısıysa e-Fatura (temel
+senaryo), değilse e-Arşiv (entegratör müşteriye e-posta gönderir).
+- **Uyumsoft** (`src/einvoice/uyumsoft.rs`, `ubl.rs`): SOAP 1.1 + WS-Security UsernameToken. Alıcı
+  türü `IsEInvoiceUser` ile anlık sorgulanır (posta kutusu verilmez: alıcının varsayılanı). Fatura
+  UBL-TR 2.1 olarak bizde üretilir (`SendInvoice`, UUID = ETTN, `LocalDocumentId` = sipariş no,
+  `cbc:ID` boş: numarayı Uyumsoft seriden verir). Durum `QueryOutboxInvoiceStatus` (Uyumsoft
+  durumları 0/20/30/40/50/60/100 ölçeğine eşlenir), PDF `GetOutboxInvoicePdf`.
+- **Turkcell** (`src/einvoice/turkcell.rs`, `model.rs`): REST + `x-api-key`. GİB listesi günde bir
+  `einvoice_users` tablosuna indirilir; posta kutusu listeden.
+- Her fatura kesildiği entegratörle (`invoices.provider`) kaydedilir; durum takibi ve PDF yalnız o
+  entegratör seçiliyken çalışır.
 - ETTN gönderimden önce yazılır; yeniden denemede önce ETTN ile durum sorgulanır → çift fatura yok.
 - KDV ve dip toplam bizden gider (`useCalculatedVatAmount`): fatura toplamı tahsilatla kuruşu kuruşuna aynı.
-- Geçici hata: 2, 4, 8 … dk (en çok 6 sa) beklemeyle 8 deneme; kalıcı hata (422, 401/403) ya da 8.
+- Geçici hata: 2, 4, 8 … dk (en çok 6 sa) beklemeyle 8 deneme; kalıcı hata (Turkcell 422/401/403,
+  Uyumsoft `IsSucceded=false` ya da güvenlik hatası) ya da 8.
   deneme → `failed` + `ALERT_EMAIL`. Yönetici panelinde "Yeniden dene" / "Elle kesildi".
 - Kesilen faturanın GİB sonucu 2 gün izlenir (60 onay, 40 hata → `failed` + uyarı).
 - Uçlar: `GET /api/v1/members/:id/invoices`, `GET /api/v1/invoices/:id/pdf?member_id=`,
@@ -250,7 +262,7 @@ DB oturumu UTC'ye sabitlenir (`SET TIME ZONE 'UTC'`); tüm tarih sütunları UTC
 ### Testler
 ```bash
 cargo test                    # unit testler
-bash scripts/e2e/run.sh       # Docker Postgres + mock PayTR ile uçtan uca (WSL)
+bash scripts/e2e/run.sh       # Docker Postgres + sahte PayTR, Turkcell ve Uyumsoft ile uçtan uca (WSL)
 ```
 
 ---

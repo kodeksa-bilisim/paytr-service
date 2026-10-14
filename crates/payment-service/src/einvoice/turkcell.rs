@@ -1,8 +1,7 @@
 //! Turkcell e-Şirket e-Fatura/e-Arşiv REST istemcisi (https://developer.turkcellesirket.com/fatura).
 //!
-//! Kimlik doğrulama `x-api-key` başlığıyla. Yanıt sınıflandırması yeniden deneme kararını belirler:
-//! 400/422 ve 401/403 kalıcıdır (aynı istek yine reddedilir), 404 kayıt yok, 429/5xx ve ağ
-//! hataları geçicidir.
+//! Kimlik doğrulama `x-api-key` başlığıyla. HTTP durumu hata sınıfını belirler: 400/422 ve 401/403
+//! kalıcıdır, 404 kayıt yok, 429/5xx ve ağ hataları geçicidir (bkz. `ProviderError`).
 
 use std::io::Read;
 use std::time::Duration;
@@ -10,31 +9,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::DocType;
-
-#[derive(Debug, thiserror::Error)]
-pub enum TcError {
-    #[error("Turkcell isteği reddetti: {0}")]
-    Validation(String),
-    #[error("Turkcell yetki hatası: {0}")]
-    Auth(String),
-    #[error("Turkcell'de kayıt yok")]
-    NotFound,
-    #[error("Turkcell'e ulaşılamadı: {0}")]
-    Transient(String),
-}
-
-impl TcError {
-    /// Yeniden denemek sonucu değiştirmez.
-    pub fn is_permanent(&self) -> bool {
-        matches!(self, TcError::Validation(_) | TcError::Auth(_))
-    }
-
-    /// Aynı ETTN zaten kayıtlı ("… ettn '…' sistemde mevcut.").
-    pub fn is_duplicate_ettn(&self) -> bool {
-        matches!(self, TcError::Validation(m) if m.contains("sistemde mevcut"))
-    }
-}
+use super::{Created, DocType, ProviderError as TcError, Status};
 
 /// HTTP durum koduna göre hata türü; gövde mesajı kısaltılarak taşınır.
 pub fn classify(status: u16, body: &str) -> TcError {
@@ -47,20 +22,6 @@ pub fn classify(status: u16, body: &str) -> TcError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Created {
-    pub id: String,
-    pub invoice_number: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Status {
-    /// e-Arşiv: 0 taslak, 20 kuyruk, 30 GİB'e gidiyor, 40 hata, 50 iletildi, 60 onaylandı, 100 iptal.
-    pub status: i32,
-    pub invoice_number: Option<String>,
-    pub message: Option<String>,
-}
-
 /// Yanıt alanları belgelerde PascalCase, gerçekte camelCase geliyor: ikisi de kabul edilir.
 fn field<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
     v.as_object()?.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v)
@@ -71,7 +32,8 @@ fn text(v: &Value, name: &str) -> Option<String> {
 }
 
 pub fn parse_created(v: &Value) -> Option<Created> {
-    Some(Created { id: text(v, "id")?, invoice_number: text(v, "invoiceNumber")? })
+    text(v, "id")?;
+    Some(Created { invoice_number: text(v, "invoiceNumber")? })
 }
 
 pub fn parse_status(v: &Value) -> Option<Status> {
@@ -226,7 +188,7 @@ mod tests {
     fn responses_accept_both_casings() {
         assert_eq!(
             parse_created(&json!({"id":"abc","invoiceNumber":"OGV2026000000352"})),
-            Some(Created { id: "abc".into(), invoice_number: "OGV2026000000352".into() })
+            Some(Created { invoice_number: "OGV2026000000352".into() })
         );
         assert_eq!(parse_created(&json!({"Id":"abc","InvoiceNumber":"X"})).unwrap().invoice_number, "X");
         assert!(parse_created(&json!({"id":"abc"})).is_none());

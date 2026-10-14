@@ -147,13 +147,13 @@ mod tests {
 
     fn cfg() -> EinvoiceConfig {
         EinvoiceConfig {
-            base_url: "https://x".into(),
-            api_key: "k".into(),
+            provider: crate::config::EinvoiceProvider::Turkcell { base_url: "https://x".into(), api_key: "k".into() },
             start_at: None,
             shipment_id: "1111111111".into(),
             shipment_name: "Elektronik teslimat".into(),
             website: "https://nlink.tr".into(),
             prefix: None,
+            seller: None,
         }
     }
 

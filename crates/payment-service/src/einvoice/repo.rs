@@ -65,9 +65,9 @@ pub async fn set_doc_type(pool: &PgPool, id: i32, doc_type: &str) -> Result<()> 
     Ok(())
 }
 
-pub async fn mark_issued(pool: &PgPool, id: i32, invoice_no: Option<&str>, provider_status: Option<i32>) -> Result<()> {
+pub async fn mark_issued(pool: &PgPool, id: i32, provider: &str, invoice_no: Option<&str>, provider_status: Option<i32>) -> Result<()> {
     sqlx::query(
-        "UPDATE invoices SET status = 'issued', provider = 'turkcell', provider_ref = ettn::text,
+        "UPDATE invoices SET status = 'issued', provider = $4, provider_ref = ettn::text,
                 invoice_no = COALESCE($2, invoice_no), provider_status = $3,
                 issued_at = COALESCE(issued_at, NOW()), invoice_date = COALESCE(invoice_date, created_at),
                 last_error = NULL, next_attempt_at = NULL, checked_at = NOW(), updated_at = NOW()
@@ -76,6 +76,7 @@ pub async fn mark_issued(pool: &PgPool, id: i32, invoice_no: Option<&str>, provi
     .bind(id)
     .bind(invoice_no)
     .bind(provider_status.map(|s| s as i16))
+    .bind(provider)
     .execute(pool)
     .await?;
     Ok(())
@@ -127,17 +128,18 @@ pub struct Unconfirmed {
     pub invoice_no: Option<String>,
 }
 
-/// Son 2 günde kesilmiş, onayı (60) görülmemiş, 5 dakikadır sorgulanmamış kayıtlar.
-pub async fn unconfirmed(pool: &PgPool, limit: i64) -> Result<Vec<Unconfirmed>> {
+/// Bu entegratörde son 2 günde kesilmiş, onayı (60) görülmemiş, 5 dakikadır sorgulanmamış kayıtlar.
+pub async fn unconfirmed(pool: &PgPool, provider: &str, limit: i64) -> Result<Vec<Unconfirmed>> {
     Ok(sqlx::query_as::<_, Unconfirmed>(
         "SELECT id, merchant_oid, member_id, ettn::text AS ettn, doc_type, invoice_no FROM invoices
-         WHERE status = 'issued' AND provider = 'turkcell' AND ettn IS NOT NULL AND doc_type IS NOT NULL
+         WHERE status = 'issued' AND provider = $2 AND ettn IS NOT NULL AND doc_type IS NOT NULL
            AND COALESCE(provider_status, 0) < 60
            AND issued_at > NOW() - INTERVAL '2 days'
            AND COALESCE(checked_at, '-infinity') <= NOW() - INTERVAL '5 minutes'
          ORDER BY issued_at LIMIT $1",
     )
     .bind(limit)
+    .bind(provider)
     .fetch_all(pool)
     .await?)
 }
@@ -198,7 +200,7 @@ pub struct MemberInvoice {
 pub async fn member_invoices(pool: &PgPool, member_id: i32) -> Result<Vec<MemberInvoice>> {
     Ok(sqlx::query_as::<_, MemberInvoice>(
         "SELECT id, created_at, invoice_no, total_kurus, status, doc_type,
-                (status = 'issued' AND provider = 'turkcell' AND ettn IS NOT NULL) AS has_pdf
+                (status = 'issued' AND provider IN ('uyumsoft', 'turkcell') AND ettn IS NOT NULL) AS has_pdf
          FROM invoices WHERE member_id = $1 AND kind = 'sale' AND status <> 'cancelled'
          ORDER BY created_at DESC, id DESC LIMIT 200",
     )
@@ -207,11 +209,11 @@ pub async fn member_invoices(pool: &PgPool, member_id: i32) -> Result<Vec<Member
     .await?)
 }
 
-/// PDF için: (üye, belge türü, ETTN, numara) — yalnızca Turkcell'de kesilmişse.
-pub async fn pdf_ref(pool: &PgPool, id: i32) -> Result<Option<(i32, String, String, Option<String>)>> {
+/// PDF için: (üye, belge türü, ETTN, numara, entegratör) — yalnızca bir entegratörde kesilmişse.
+pub async fn pdf_ref(pool: &PgPool, id: i32) -> Result<Option<(i32, String, String, Option<String>, String)>> {
     Ok(sqlx::query_as(
-        "SELECT member_id, doc_type, ettn::text, invoice_no FROM invoices
-         WHERE id = $1 AND status = 'issued' AND provider = 'turkcell' AND ettn IS NOT NULL AND doc_type IS NOT NULL",
+        "SELECT member_id, doc_type, ettn::text, invoice_no, provider FROM invoices
+         WHERE id = $1 AND status = 'issued' AND provider IN ('uyumsoft', 'turkcell') AND ettn IS NOT NULL AND doc_type IS NOT NULL",
     )
     .bind(id)
     .fetch_optional(pool)
