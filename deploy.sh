@@ -50,14 +50,20 @@ cp payment-service payment-service.bak
 chmod +x payment-service.new
 mv payment-service.new payment-service
 sudo systemctl restart $SERVICE
-sleep 3
 PORT=\$(grep -E '^PORT=' .env | cut -d= -f2 | tr -d '\r')
-if systemctl is-active --quiet $SERVICE && curl -fsS "http://127.0.0.1:\${PORT:-3002}/health" >/dev/null; then
+# Migration uzun sürebilir: sağlık 20 sn boyunca beklenir.
+HEALTHY=0
+for _ in \$(seq 1 20); do
+  sleep 1
+  if systemctl is-active --quiet $SERVICE && curl -fsS "http://127.0.0.1:\${PORT:-3002}/health" >/dev/null; then HEALTHY=1; break; fi
+done
+if [ "\$HEALTHY" = 1 ]; then
   echo "Servis sağlıklı."
 else
   echo "HATA: servis sağlıksız — eski binary'ye dönülüyor"
   journalctl -u $SERVICE -n 30 --no-pager || true
-  cp payment-service.bak payment-service
+  # Çalışan dosyanın üzerine cp yazılamaz ("Text file busy"): yedek kopyalanıp yerine taşınır.
+  cp payment-service.bak payment-service.rollback && mv payment-service.rollback payment-service
   sudo systemctl restart $SERVICE
   exit 1
 fi
