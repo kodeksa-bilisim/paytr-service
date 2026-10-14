@@ -290,7 +290,20 @@ pub struct PaymentInfo<'a> {
 /// `renews`: abonelik bir sonraki dönem otomatik yenilenecek mi (iptal edilmediyse true).
 pub fn payment_success(p: &PaymentInfo, is_first: bool, renews: bool) -> EmailContent {
     let plan = plan_label(p.plan);
-    let (subject, eyebrow, heading, lead) = if is_first {
+    // Tutarın tamamı indirimle karşılandı: ödeme alınmadı.
+    let free = crate::pricing::amount_to_kurus(p.amount) == Some(0);
+    let (subject, eyebrow, heading, lead) = if free {
+        (
+            format!("Aboneliğiniz {}: {plan} Plan", if is_first { "başlatıldı" } else { "yenilendi" }),
+            if is_first { "Abonelik Onayı" } else { "Yenileme Onayı" },
+            if is_first { "Aboneliğiniz başlatıldı" } else { "Aboneliğiniz yenilendi" },
+            format!(
+                "<strong>{}</strong> plan aboneliğiniz indirim kodunuzla ödeme alınmadan {}.",
+                esc(&plan),
+                if is_first { "başlatılmıştır" } else { "yenilenmiştir" }
+            ),
+        )
+    } else if is_first {
         (
             format!("Aboneliğiniz başlatıldı: {plan} Plan"),
             "Ödeme Onayı",
@@ -317,7 +330,10 @@ pub fn payment_success(p: &PaymentInfo, is_first: bool, renews: bool) -> EmailCo
         ("Tutar", format_tl(p.amount)),
         ("Dönem bitişi", date.clone()),
     ];
-    let note = if renews {
+    let note = if free && renews {
+        "İndirim kodunuz geçerli olduğu sürece aboneliğiniz ödeme alınmadan yenilenir. Ücretsiz dönem bittiğinde          kayıtlı kartınız yoksa abonelik dönem sonunda sona erer; devam etmek için Planlar sayfasından abone olabilirsiniz."
+            .to_string()
+    } else if renews {
         details.push(("Sonraki ödeme", date.clone()));
         format!(
             "Aboneliğiniz her {} kayıtlı kartınızdan otomatik olarak yenilenir. Dilediğiniz zaman Planlar sayfasından \

@@ -21,10 +21,13 @@ pub struct Coupon {
     pub active: bool,
     pub note: Option<String>,
     pub created_at: NaiveDateTime,
+    /// Arşivlenmiş (silinmiş ama kullanım geçmişi olan) kod; listede ve ödemede görünmez.
+    #[serde(skip)]
+    pub deleted_at: Option<NaiveDateTime>,
 }
 
 pub async fn find_coupon<'e>(ex: impl PgExecutor<'e>, code: &str) -> Result<Option<Coupon>> {
-    Ok(sqlx::query_as::<_, Coupon>("SELECT * FROM coupons WHERE code = $1").bind(code).fetch_optional(ex).await?)
+    Ok(sqlx::query_as::<_, Coupon>("SELECT * FROM coupons WHERE code = $1 AND deleted_at IS NULL").bind(code).fetch_optional(ex).await?)
 }
 
 pub async fn member_redeemed(pool: &PgPool, code: &str, member_id: i32) -> Result<bool> {
@@ -90,7 +93,7 @@ pub async fn record_redemption<'c>(
 }
 
 pub async fn list_coupons(pool: &PgPool) -> Result<Vec<Coupon>> {
-    Ok(sqlx::query_as::<_, Coupon>("SELECT * FROM coupons ORDER BY created_at DESC LIMIT 500").fetch_all(pool).await?)
+    Ok(sqlx::query_as::<_, Coupon>("SELECT * FROM coupons WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 500").fetch_all(pool).await?)
 }
 
 pub struct NewCoupon<'a> {
@@ -126,8 +129,55 @@ pub async fn create_coupon(pool: &PgPool, c: NewCoupon<'_>) -> Result<bool> {
 }
 
 pub async fn set_coupon_active(pool: &PgPool, code: &str, active: bool) -> Result<bool> {
-    let r = sqlx::query("UPDATE coupons SET active = $2 WHERE code = $1").bind(code).bind(active).execute(pool).await?;
+    let r = sqlx::query("UPDATE coupons SET active = $2 WHERE code = $1 AND deleted_at IS NULL").bind(code).bind(active).execute(pool).await?;
     Ok(r.rows_affected() > 0)
+}
+
+/// Kod daha önce kullanılıp silinmiş mi (yeniden oluşturulamaz: kullanım kayıtları ona bağlı).
+pub async fn coupon_archived(pool: &PgPool, code: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM coupons WHERE code = $1 AND deleted_at IS NOT NULL)")
+        .bind(code)
+        .fetch_one(pool)
+        .await?)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CouponDeleted {
+    /// Hiç kullanılmamıştı: kayıt tamamen silindi.
+    Removed,
+    /// Kullanım geçmişi ya da açık ödeme penceresi var: arşivlendi.
+    Archived,
+}
+
+/// Kodu siler. Kullanılmış ya da bekleyen bir ödemede seçilmiş kod arşivlenir (kullanım kayıtları
+/// ve bekleyen ödemenin callback'i ona bağlı); diğerleri tamamen silinir. Süren aboneliklerdeki
+/// indirim (abonelik metadata'sında) etkilenmez. Silme öncesi hâl döner.
+pub async fn delete_coupon(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    code: &str,
+) -> Result<Option<(Coupon, CouponDeleted)>> {
+    let Some(c) = sqlx::query_as::<_, Coupon>("SELECT * FROM coupons WHERE code = $1 AND deleted_at IS NULL FOR UPDATE")
+        .bind(code)
+        .fetch_optional(&mut **tx)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let referenced: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM coupon_redemptions WHERE code = $1)
+             OR EXISTS(SELECT 1 FROM paytr_subscriptions WHERE status = 'pending' AND metadata->'discount'->>'code' = $1)",
+    )
+    .bind(code)
+    .fetch_one(&mut **tx)
+    .await?;
+    let how = if referenced {
+        sqlx::query("UPDATE coupons SET deleted_at = NOW(), active = FALSE WHERE code = $1").bind(code).execute(&mut **tx).await?;
+        CouponDeleted::Archived
+    } else {
+        sqlx::query("DELETE FROM coupons WHERE code = $1").bind(code).execute(&mut **tx).await?;
+        CouponDeleted::Removed
+    };
+    Ok(Some((c, how)))
 }
 
 // ── Referans ─────────────────────────────────────────────────────────────────

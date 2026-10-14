@@ -158,6 +158,10 @@ fn subscription_metadata(base: Option<serde_json::Value>, adj: &crate::growth::A
     if let Some(extra) = adj.metadata() {
         m.extend(extra);
     }
+    // Ödemesiz başlayan abonelik: kart yok; indirim yenilemeyi de karşılamıyorsa dönem sonunda biter.
+    if adj.final_kurus == 0 && adj.discount_kurus > 0 {
+        m.insert("free".into(), true.into());
+    }
     (!m.is_empty()).then_some(serde_json::Value::Object(m))
 }
 
@@ -170,6 +174,28 @@ async fn hold_coupon(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, adj: &crate
     if !crate::db::growth_repo::coupon_has_room(tx, code).await? {
         return Err(AppError::BadRequest("Bu indirim kodunun kullanım sınırı doldu.".to_string()));
     }
+    Ok(())
+}
+
+/// Tutarın tamamı indirimle karşılandı: kayıtlar oluşturulduktan sonra ödeme, PayTR'a gitmeden
+/// callback ile aynı yoldan başarılı sayılır (abonelik, kupon kullanımı, e-posta). Kart saklanmaz.
+pub(crate) async fn complete_free(state: &crate::AppData, merchant_oid: &str) -> Result<(), AppError> {
+    let payload = crate::models::callback::CallbackPayload {
+        merchant_oid: merchant_oid.to_string(),
+        status: "success".to_string(),
+        total_amount: "0".to_string(),
+        hash: String::new(),
+        utoken: None,
+        failed_reason_code: None,
+        failed_reason_msg: None,
+        test_mode: None,
+        payment_type: Some("free".to_string()),
+        currency: None,
+        payment_amount: None,
+        installment_count: None,
+    };
+    crate::handlers::callback::handle_success(state, &payload).await?;
+    tracing::info!(merchant_oid, "Ödemesiz (tam indirimli) işlem tamamlandı");
     Ok(())
 }
 
@@ -234,6 +260,7 @@ pub async fn init_payment(
     let charge = compute_charge(&state, member_id, &req.plan, list_kurus).await?;
     let adj = crate::growth::adjust(&state, member_id, &req.plan, &req.billing_cycle, req.coupon_code.as_deref(), charge.charge_kurus).await?;
     let charge_amount = format_tl(adj.final_kurus);
+    let free = adj.final_kurus == 0;
 
     let basket_items = if adj.final_kurus != charge.list_kurus {
         adjusted_basket(&format!("{} Plan", crate::email_templates::plan_label(&req.plan)), &charge, &adj)
@@ -296,9 +323,9 @@ pub async fn init_payment(
             merchant_oid: &req.merchant_oid,
             amount: &charge_amount,
             currency: &req.currency,
-            payment_type: &req.payment_type,
+            payment_type: if free { "free" } else { &req.payment_type },
             installment_count: req.installment_count as i32,
-            is_3d: true,
+            is_3d: !free,
             test_mode: state.config.test_mode == 1,
             utoken: None,
             ctoken: None,
@@ -307,6 +334,9 @@ pub async fn init_payment(
     .await
     .map_err(anyhow::Error::from)?;
     tx.commit().await.map_err(anyhow::Error::from)?;
+    if free {
+        complete_free(&state, &req.merchant_oid).await?;
+    }
 
     tracing::info!(
         member_id,
@@ -326,7 +356,8 @@ pub async fn init_payment(
             list_amount: format_tl(charge.list_kurus),
             credit_amount: format_tl(charge.credit_kurus),
             discount_amount: format_tl(adj.discount_kurus + adj.credit_used_kurus),
-            form_params: PaytrFormParams {
+            free,
+            form_params: (!free).then(|| PaytrFormParams {
                 merchant_id: state.config.merchant_id.clone(),
                 paytr_token,
                 user_ip: req.user_ip,
@@ -351,7 +382,7 @@ pub async fn init_payment(
                 lang: req.client_lang,
                 card_type: req.card_type,
                 debug_on: debug_flag(&state, req.debug_on),
-            },
+            }),
         }),
     ))
 }
@@ -375,6 +406,7 @@ pub async fn init_enterprise_payment(
     let charge = compute_charge(&state, member_id, "enterprise", list_kurus).await?;
     let adj = crate::growth::adjust(&state, member_id, "enterprise", &req.billing_cycle, req.coupon_code.as_deref(), charge.charge_kurus).await?;
     let charge_amount = format_tl(adj.final_kurus);
+    let free = adj.final_kurus == 0;
 
     let basket_label = format!(
         "Enterprise Plan{} ({} kullanıcı, {}k link/ay, {}k tıklama/ay)",
@@ -451,9 +483,9 @@ pub async fn init_enterprise_payment(
             merchant_oid: &req.merchant_oid,
             amount: &charge_amount,
             currency: "TL",
-            payment_type: "card",
+            payment_type: if free { "free" } else { "card" },
             installment_count: 0,
-            is_3d: true,
+            is_3d: !free,
             test_mode: state.config.test_mode == 1,
             utoken: None,
             ctoken: None,
@@ -462,6 +494,9 @@ pub async fn init_enterprise_payment(
     .await
     .map_err(anyhow::Error::from)?;
     tx.commit().await.map_err(anyhow::Error::from)?;
+    if free {
+        complete_free(&state, &req.merchant_oid).await?;
+    }
 
     tracing::info!(
         member_id,
@@ -480,7 +515,8 @@ pub async fn init_enterprise_payment(
             list_amount,
             credit_amount: format_tl(charge.credit_kurus),
             discount_amount: format_tl(adj.discount_kurus + adj.credit_used_kurus),
-            form_params: PaytrFormParams {
+            free,
+            form_params: (!free).then(|| PaytrFormParams {
                 merchant_id: state.config.merchant_id.clone(),
                 paytr_token,
                 user_ip: req.user_ip,
@@ -504,7 +540,7 @@ pub async fn init_enterprise_payment(
                 lang: req.client_lang,
                 card_type: req.card_type,
                 debug_on: debug_flag(&state, req.debug_on),
-            },
+            }),
         }),
     ))
 }
@@ -682,5 +718,8 @@ mod tests {
         assert_eq!(m["credit_used_kurus"], 500);
         assert_eq!(serde_json::from_value::<crate::pricing::Discount>(m["discount"].clone()).unwrap(), d);
         assert!(subscription_metadata(None, &crate::growth::Adjusted::default()).is_none());
+        let full = crate::growth::Adjusted { discount: Some(d), discount_kurus: 89_900, credit_used_kurus: 0, final_kurus: 0 };
+        assert_eq!(subscription_metadata(None, &full).unwrap()["free"], true);
+        assert!(m.get("free").is_none());
     }
 }

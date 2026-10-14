@@ -137,6 +137,13 @@ async fn resolve_stale_pending(state: &AppState) {
     };
     for p in list {
         let oid = p.merchant_oid.as_str();
+        // Ödemesiz (tam indirimli) kayıt PayTR'da yok: yarım kaldıysa aynı yoldan tamamlanır.
+        if p.payment_type == "free" {
+            if let Err(e) = crate::handlers::payment::complete_free(state, oid).await {
+                tracing::error!(merchant_oid = oid, "Ödemesiz işlem tamamlanamadı: {:?}", e);
+            }
+            continue;
+        }
         match query_payment_status(state, oid).await {
             Ok(PaytrStatus::Paid { total_kurus, refunded: false }) => {
                 tracing::warn!(merchant_oid = oid, "Callback'i gelmemiş başarılı ödeme bulundu, işleniyor");
@@ -291,6 +298,9 @@ pub async fn process_due(state: &AppState) -> anyhow::Result<()> {
             }
         }
     }
+
+    // Kartsız ödemesiz abonelikler: indirim yenilemeyi de karşılıyorsa ödemesiz yenilenir.
+    renew_free_subscriptions(state).await;
 
     // Süresi dolmuş abonelikleri 'expired' yap, kullanıcıları Standard'a düşür, kartları sil.
     expire_subscriptions(state).await?;
@@ -523,16 +533,8 @@ async fn alert_renewal_blocked(state: &AppState, sub: &DueSubscription, reason: 
     email::send(mailer, email_cfg, to, content).await;
 }
 
-async fn charge(state: &AppState, sub: &DueSubscription) -> Result<(), ChargeError> {
-    // Çift ödeme koruması: aynı abonelik için zaten bekleyen ödeme varsa atla
-    if payment_repo::has_pending(&state.db, sub.subscription_id).await? {
-        tracing::warn!(
-            subscription_id = sub.subscription_id,
-            "Beklemede ödeme mevcut, bu döngü atlandı"
-        );
-        return Ok(());
-    }
-
+/// Yenilemede çekilecek tutar (kuruş): liste fiyatı − hâlâ geçerli indirim.
+fn renewal_amount_kurus(sub: &DueSubscription) -> anyhow::Result<i64> {
     // Tutar normalize edilir: kayıtta "149.00" (TL) ya da eski biçimde kuruş olabilir; PayTR
     // TL bekler (ham "14900" gönderilseydi 14.900 TL çekilmeye çalışılırdı).
     let list_kurus = amount_to_kurus(&sub.amount)
@@ -545,7 +547,92 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> Result<(), ChargeErr
         .and_then(|m| m.get("discount"))
         .and_then(|d| serde_json::from_value::<crate::pricing::Discount>(d.clone()).ok())
         .filter(|d| d.applies_to_renewal());
-    let amount_kurus = list_kurus - discount.map_or(0, |d| d.amount_off(list_kurus));
+    Ok(list_kurus - discount.map_or(0, |d| d.amount_off(list_kurus)))
+}
+
+/// İndirim yenileme tutarının tamamını karşılıyor: PayTR'a gitmeden ödemesiz yenilenir
+/// (callback ile aynı yol: dönem uzar, indirim sayacı azalır, e-posta gider).
+async fn free_renewal(state: &AppState, sub: &DueSubscription) -> Result<(), ChargeError> {
+    let merchant_oid = renewal_merchant_oid(sub.subscription_id, Utc::now().timestamp_millis());
+    if let Err(e) = payment_repo::create(
+        &state.db,
+        payment_repo::NewPayment {
+            member_id: sub.member_id,
+            subscription_id: Some(sub.subscription_id),
+            merchant_oid: &merchant_oid,
+            amount: "0.00",
+            currency: &sub.currency,
+            payment_type: "free",
+            installment_count: 0,
+            is_3d: false,
+            test_mode: state.config.test_mode == 1,
+            utoken: None,
+            ctoken: None,
+        },
+    )
+    .await
+    {
+        if payment_repo::is_unique_violation(&e) {
+            return Ok(());
+        }
+        return Err(e.into());
+    }
+    crate::handlers::payment::complete_free(state, &merchant_oid)
+        .await
+        .map_err(|e| ChargeError::Internal(anyhow::anyhow!("ödemesiz yenileme işlenemedi: {e:?}")))?;
+    tracing::info!(subscription_id = sub.subscription_id, member_id = sub.member_id, "Abonelik ödemesiz yenilendi (tam indirim)");
+    Ok(())
+}
+
+/// Kartsız ödemesiz abonelikler: indirim sürüyorsa ödemesiz yenilenir; bittiyse dokunulmaz,
+/// abonelik dönem sonunda sona erer (`mark_expired`).
+async fn renew_free_subscriptions(state: &AppState) {
+    let due = match subscription_repo::query_due_free(&state.db).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("Ödemesiz yenilemeler okunamadı: {:?}", e);
+            return;
+        }
+    };
+    for sub in &due {
+        match subscription_repo::claim_renewal_attempt(&state.db, sub.subscription_id).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                tracing::error!(subscription_id = sub.subscription_id, "Deneme zamanı yazılamadı, atlandı: {:?}", e);
+                continue;
+            }
+        }
+        match renewal_amount_kurus(sub) {
+            Ok(0) => {
+                if let Err(e) = free_renewal(state, sub).await {
+                    tracing::error!(subscription_id = sub.subscription_id, "Ödemesiz yenileme başarısız: {:?}", e);
+                }
+            }
+            Ok(_) => tracing::info!(
+                subscription_id = sub.subscription_id,
+                member_id = sub.member_id,
+                "Ücretsiz dönem bitti, kayıtlı kart yok: abonelik dönem sonunda sona erecek"
+            ),
+            Err(e) => tracing::error!(subscription_id = sub.subscription_id, "Yenileme tutarı hesaplanamadı: {:?}", e),
+        }
+    }
+}
+
+async fn charge(state: &AppState, sub: &DueSubscription) -> Result<(), ChargeError> {
+    // Çift ödeme koruması: aynı abonelik için zaten bekleyen ödeme varsa atla
+    if payment_repo::has_pending(&state.db, sub.subscription_id).await? {
+        tracing::warn!(
+            subscription_id = sub.subscription_id,
+            "Beklemede ödeme mevcut, bu döngü atlandı"
+        );
+        return Ok(());
+    }
+
+    let amount_kurus = renewal_amount_kurus(sub)?;
+    if amount_kurus == 0 {
+        return free_renewal(state, sub).await;
+    }
     let amount = format_tl(amount_kurus);
 
     let phone = if sub.user_phone.trim().is_empty() { state.config.fallback_phone.as_str() } else { sub.user_phone.as_str() };

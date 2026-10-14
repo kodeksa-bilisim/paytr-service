@@ -194,6 +194,9 @@ pub async fn create_coupon(State(state): State<AppState>, Json(req): Json<NewCou
     )
     .await?;
     if !created {
+        if growth_repo::coupon_archived(&state.db, &code).await? {
+            return Err(bad("Bu kod daha önce kullanılıp silinmiş; başka bir kod seçin"));
+        }
         return Err(bad("Bu kod zaten var"));
     }
     tracing::info!(code = %code, "Kupon oluşturuldu");
@@ -216,4 +219,39 @@ pub async fn set_coupon_active(
         return Err(AppError::BadRequest("Kupon bulunamadı".into()));
     }
     Ok(Json(json!({ "code": code, "active": req.active })))
+}
+
+#[derive(Deserialize)]
+pub struct DeleteCouponRequest {
+    actor: crate::handlers::admin_members::Actor,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// POST /api/v1/admin/coupons/{code}/delete — kodu siler (kullanılmışsa arşivler). Kodu kullanmış
+/// üyelerin süren indirimi abonelik kaydında olduğu için değişmez.
+pub async fn delete_coupon(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+    Json(req): Json<DeleteCouponRequest>,
+) -> Result<Json<Value>, AppError> {
+    let code = normalize_coupon_code(&code).ok_or_else(|| AppError::BadRequest("Geçersiz kod".into()))?;
+    let mut tx = state.db.begin().await.map_err(anyhow::Error::from)?;
+    let Some((old, how)) = growth_repo::delete_coupon(&mut tx, &code).await? else {
+        return Err(AppError::BadRequest("Kupon bulunamadı".into()));
+    };
+    let archived = how == growth_repo::CouponDeleted::Archived;
+    crate::handlers::admin_members::audit(
+        &mut *tx,
+        &req.actor,
+        0,
+        "coupon.delete",
+        &json!({ "code": old.code, "kind": old.kind, "value": old.value, "redemptions": old.redemptions, "active": old.active }),
+        &json!({ "archived": archived }),
+        req.note.as_deref(),
+    )
+    .await?;
+    tx.commit().await.map_err(anyhow::Error::from)?;
+    tracing::info!(code = %code, archived, actor = req.actor.actor_id, "Kupon silindi");
+    Ok(Json(json!({ "code": code, "archived": archived })))
 }

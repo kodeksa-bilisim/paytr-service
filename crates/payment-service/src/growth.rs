@@ -136,6 +136,7 @@ mod tests {
             active: true,
             note: None,
             created_at: now,
+            deleted_at: None,
         }
     }
 

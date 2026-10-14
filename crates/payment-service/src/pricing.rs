@@ -155,13 +155,18 @@ pub struct Discount {
 }
 
 impl Discount {
-    /// Bu tutardan düşülecek indirim (kuruş). Tahsilat en az `MIN_CHARGE_KURUS` kalır.
+    /// Bu tutardan düşülecek indirim (kuruş). Tutarın tamamını karşılayan indirim (%100 ya da
+    /// tutardan büyük sabit indirim) ödemeyi sıfırlar: abonelik ödeme alınmadan başlar/yenilenir.
+    /// Kısmi indirimde tahsilat en az `MIN_CHARGE_KURUS` kalır (PayTR alt sınırı).
     pub fn amount_off(&self, kurus: i64) -> i64 {
         let raw = match (self.percent, self.fixed_kurus) {
             (Some(p), _) => kurus * p.clamp(0, 100) / 100,
             (None, Some(f)) => f.max(0),
             _ => 0,
         };
+        if raw >= kurus {
+            return kurus.max(0);
+        }
         raw.min((kurus - MIN_CHARGE_KURUS).max(0))
     }
 
@@ -191,8 +196,16 @@ mod tests {
         let pct = Discount { source: "coupon".into(), code: Some("X".into()), percent: Some(30), fixed_kurus: None, cycles_left: Some(2) };
         assert_eq!(pct.amount_off(89_900), 26_970);
         let fixed = Discount { percent: None, fixed_kurus: Some(100_000), ..pct.clone() };
-        // Sabit indirim tutarı aşamaz; en az MIN_CHARGE kalır.
-        assert_eq!(fixed.amount_off(34_900), 34_900 - MIN_CHARGE_KURUS);
+        // Tutarı aşan sabit indirim ödemeyi sıfırlar.
+        assert_eq!(fixed.amount_off(34_900), 34_900);
+        // Kısmi indirimde en az MIN_CHARGE kalır.
+        let almost = Discount { percent: None, fixed_kurus: Some(34_850), ..pct.clone() };
+        assert_eq!(almost.amount_off(34_900), 34_900 - MIN_CHARGE_KURUS);
+        let full = Discount { percent: Some(100), fixed_kurus: None, ..pct.clone() };
+        assert_eq!(full.amount_off(89_900), 89_900);
+        let ninety_nine = Discount { percent: Some(99), ..full.clone() };
+        assert_eq!(ninety_nine.amount_off(10_000), 9_900);
+        assert_eq!(ninety_nine.amount_off(100), 0);
         assert!(pct.applies_to_renewal());
         let once = pct.after_renewal().after_renewal();
         assert_eq!(once.cycles_left, Some(0));

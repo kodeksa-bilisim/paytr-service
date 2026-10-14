@@ -81,6 +81,10 @@ async fn record_invoice(
         tracing::info!(merchant_oid = %payment.merchant_oid, member_id = payment.member_id, "Şirket içi hesap: fatura kaydı açılmadı");
         return;
     }
+    if payment.payment_type == "free" {
+        tracing::info!(merchant_oid = %payment.merchant_oid, "Ödemesiz (tam indirimli) işlem: fatura kaydı açılmadı");
+        return;
+    }
     let Some(total) = amount_to_kurus(&payment.amount).filter(|k| *k > 0) else {
         tracing::error!(merchant_oid = %payment.merchant_oid, amount = %payment.amount, "Fatura kaydı atlandı: tutar okunamadı");
         return;
@@ -192,6 +196,8 @@ pub(crate) async fn handle_success(state: &crate::AppData, payload: &CallbackPay
             }
             Some(ut.to_string())
         }
+        // Ödemesiz (tam indirimli) işlemde kart yok: üyenin eski kartı bu aboneliğe bağlanmaz.
+        None if payment.payment_type == "free" => None,
         None => card_repo::get_user_token(&state.db, member_id)
             .await
             .map_err(anyhow::Error::from)?

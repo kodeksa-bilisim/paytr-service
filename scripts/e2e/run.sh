@@ -26,6 +26,8 @@ eq()  { [ "$2" = "$3" ] && ok "$1" || bad "$1" "beklenen '$3', gelen '$2'"; }
 
 cleanup() {
   [ -n "${SVC_PID:-}" ] && kill "$SVC_PID" 2>/dev/null
+  # $SVC_PID alt kabuktur: servis süreci adıyla da durdurulur (sonraki koşunun portu boş kalsın).
+  pkill -f "$ROOT/target/debug/payment-service" 2>/dev/null
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null
   [ -n "${TC_PID:-}" ] && kill "$TC_PID" 2>/dev/null
   [ -n "${UY_PID:-}" ] && kill "$UY_PID" 2>/dev/null
@@ -409,6 +411,55 @@ sql "UPDATE paytr_payments SET created_at = created_at - interval '31 minutes' W
 eq "30 dk sonra yarım kalan pencere yer tutmaz → 200" "$(post /api/v1/payments/init "$(gold_init 61 u61b ',"coupon_code":"TEK1"')" $TOKEN)" 200
 sql "UPDATE paytr_payments SET status='failed', failed_reason_msg='no_callback' WHERE merchant_oid IN ('u60a','u60b','u61b');
      UPDATE paytr_subscriptions SET status='cancelled' WHERE member_id IN (60,61) AND status='pending';" >/dev/null
+
+echo "== %100 indirim: ödeme alınmadan abonelik"
+sql "INSERT INTO customers (member_id,name,email,user_type) VALUES (70,'K70','k70@x.test','Standard'), (71,'K71','k71@x.test','Standard');"
+get /api/v1/admin/overview >/dev/null
+NOINV0=$(pyj "d['payments_without_invoice']")
+eq "%100 kupon (Gold, 2 ödeme) → 200" "$(post /api/v1/admin/coupons '{"code":"BEDAVA","kind":"percent","value":"100","plans":["gold"],"duration_cycles":2}' $TOKEN)" 200
+post /api/v1/subscriptions/upgrade-quote '{"member_id":70,"plan":"gold","billing_cycle":"monthly","coupon_code":"bedava"}' $TOKEN >/dev/null
+eq "teklif: 0 TL, yenileme de 0 TL" "$(pyj "f\"{d['charge_amount']}/{d['discount_amount']}/{d['renewal_amount']}/{d['discount_cycles']}\"")" "0.00/899.00/0.00/2"
+eq "ödemesiz başlatma → 200" "$(post /api/v1/payments/init "$(gold_init 70 u70a ',"coupon_code":"BEDAVA"')" $TOKEN)" 200
+eq "yanıt: free, PayTR formu yok" "$(pyj "f\"{d['free']}/{'form_params' in d}\"")" "True/False"
+eq "ödeme kaydı: başarılı, ödemesiz, 0 TL" "$(sql "SELECT status||'/'||payment_type||'/'||amount FROM paytr_payments WHERE merchant_oid='u70a'")" "success/free/0.00"
+SUB70=$(sql "SELECT subscription_id FROM paytr_payments WHERE merchant_oid='u70a'")
+eq "abonelik aktif, kartsız, free, 1 ödemesiz yenileme kaldı" "$(sql "SELECT status||'/'||(utoken IS NULL)::text||'/'||(metadata->>'free')||'/'||(metadata->'discount'->>'cycles_left') FROM paytr_subscriptions WHERE id=$SUB70")" "active/true/true/1"
+eq "üye Gold" "$(sql "SELECT user_type||'/'||subscription_status FROM customers WHERE member_id=70")" "Gold/active"
+eq "kupon kullanımı yazıldı" "$(sql "SELECT redemptions FROM coupons WHERE code='BEDAVA'")" 1
+eq "0 TL'ye fatura kaydı açılmadı" "$(sql "SELECT count(*) FROM invoices WHERE merchant_oid='u70a'")" 0
+get /api/v1/admin/overview >/dev/null
+eq "panelde faturasız ödeme uyarısı artmadı" "$(pyj "d['payments_without_invoice']")" "$NOINV0"
+EXP70=$(sql "SELECT expires_at FROM paytr_subscriptions WHERE id=$SUB70")
+sql "UPDATE paytr_subscriptions SET next_payment_date=$UTC - interval '1 minute', last_renewal_attempt_at=NULL WHERE id=$SUB70"
+tick
+eq "yenileme ödemesiz yapıldı" "$(sql "SELECT count(*)||'/'||min(amount)||'/'||min(payment_type) FROM paytr_payments WHERE subscription_id=$SUB70 AND merchant_oid<>'u70a' AND status='success'")" "1/0.00/free"
+eq "dönem uzadı, indirim hakkı bitti" "$(sql "SELECT (expires_at > '$EXP70')::text||'/'||(metadata->'discount'->>'cycles_left') FROM paytr_subscriptions WHERE id=$SUB70")" "true/0"
+sql "UPDATE paytr_subscriptions SET next_payment_date=$UTC - interval '1 minute', expires_at=$UTC - interval '1 minute', last_renewal_attempt_at=NULL WHERE id=$SUB70"
+tick
+eq "ücretsiz dönem bitti, kart yok → ödeme denenmedi" "$(sql "SELECT count(*) FROM paytr_payments WHERE subscription_id=$SUB70")" 2
+eq "ek süre beklenmeden sona erdi, üye Standard" "$(sql "SELECT status FROM paytr_subscriptions WHERE id=$SUB70")/$(sql "SELECT user_type FROM customers WHERE member_id=70")" "expired/Standard"
+eq "tutardan büyük sabit kupon → 200" "$(post /api/v1/admin/coupons '{"code":"FAZLA","kind":"fixed","value":"1000","duration_cycles":1}' $TOKEN)" 200
+post /api/v1/subscriptions/upgrade-quote '{"member_id":71,"plan":"gold","billing_cycle":"monthly","coupon_code":"FAZLA"}' $TOKEN >/dev/null
+eq "teklif: 0 TL, yalnız ilk ödeme" "$(pyj "f\"{d['charge_amount']}/{d['renewal_amount']}\"")" "0.00/899.00"
+
+echo "== Kupon silme"
+ACTC='"actor":{"actor_id":1,"actor_email":"admin@x.test"}'
+eq "kullanılmamış kod silindi → 200" "$(post /api/v1/admin/coupons/fazla/delete "{$ACTC}" $TOKEN)" 200
+eq "tamamen silindi" "$(pyj "d['archived']")/$(sql "SELECT count(*) FROM coupons WHERE code='FAZLA'")" "False/0"
+eq "kullanılmış kod silindi → 200" "$(post /api/v1/admin/coupons/BEDAVA/delete "{$ACTC,\"note\":\"kampanya bitti\"}" $TOKEN)" 200
+eq "arşivlendi (kullanım kaydı korunur)" "$(pyj "d['archived']")/$(sql "SELECT (deleted_at IS NOT NULL)::text||'/'||active::text FROM coupons WHERE code='BEDAVA'")/$(sql "SELECT count(*) FROM coupon_redemptions WHERE code='BEDAVA'")" "True/true/false/1"
+get /api/v1/admin/coupons >/dev/null
+eq "listede görünmez" "$(pyj "'BEDAVA' in [i['code'] for i in d['items']]")" False
+eq "silinen kod ödemede geçersiz → 400" "$(post /api/v1/subscriptions/upgrade-quote '{"member_id":71,"plan":"gold","billing_cycle":"monthly","coupon_code":"BEDAVA"}' $TOKEN)" 400
+eq "silinen kod yeniden oluşturulamaz → 400" "$(post /api/v1/admin/coupons '{"code":"BEDAVA","kind":"percent","value":"10"}' $TOKEN)/$(pyj "'silinmiş' in d['error']")" "400/True"
+eq "silinen kodu kullanan aboneliğin indirimi korunur" "$(sql "SELECT metadata->'discount'->>'code' FROM paytr_subscriptions WHERE id=$SUB70")" "BEDAVA"
+eq "silinmiş kod etkinleştirilemez → 400" "$(post /api/v1/admin/coupons/BEDAVA/active '{"active":true}' $TOKEN)" 400
+eq "olmayan kodu sil → 400" "$(post /api/v1/admin/coupons/YOKKOD/delete "{$ACTC}" $TOKEN)" 400
+eq "yöneticisiz silme isteği reddedilir" "$(post /api/v1/admin/coupons/TEK1/delete '{}' $TOKEN)" 422
+eq "açık ödeme penceresindeki kod arşivlenir" "$(post /api/v1/payments/init "$(gold_init 71 u71a ',"coupon_code":"TEK1"')" $TOKEN >/dev/null; post /api/v1/admin/coupons/TEK1/delete "{$ACTC}" $TOKEN >/dev/null; pyj "d['archived']")" True
+sql "UPDATE paytr_payments SET status='failed', failed_reason_msg='no_callback' WHERE merchant_oid='u71a';
+     UPDATE paytr_subscriptions SET status='cancelled' WHERE member_id=71 AND status='pending';" >/dev/null
+eq "iz kaydı" "$(sql "SELECT count(*)||'/'||max(note) FROM admin_actions WHERE action='coupon.delete'")" "3/kampanya bitti"
 
 echo "== Ücretsiz deneme (kartsız 7 gün Gold)"
 sql "UPDATE customers SET email_verified=true WHERE member_id IN (20,24)" >/dev/null

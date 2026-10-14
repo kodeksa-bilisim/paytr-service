@@ -143,7 +143,10 @@ pub struct InitPaymentResponse {
     pub credit_amount: String,
     /// İndirim + kredi bakiyesinden düşülen toplam.
     pub discount_amount: String,
-    pub form_params: PaytrFormParams,
+    /// İndirim tutarın tamamını karşıladı: ödeme alınmadan abonelik başlatıldı, PayTR formu yok.
+    pub free: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub form_params: Option<PaytrFormParams>,
 }
 
 /// PayTR'a gönderilecek form parametreleri (kart verisi hariç).

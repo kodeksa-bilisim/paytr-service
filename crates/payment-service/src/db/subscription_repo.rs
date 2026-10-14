@@ -289,6 +289,40 @@ pub struct DueSubscription {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// Vadesi gelen kartsız ödemesiz abonelikler (`metadata.free`). Yenileme indirimi tutarın tamamını
+/// karşılıyorsa ödemesiz yenilenir; karşılamıyorsa dokunulmaz ve dönem sonunda biter.
+pub async fn query_due_free(pool: &PgPool) -> Result<Vec<DueSubscription>> {
+    Ok(sqlx::query_as::<_, DueSubscription>(
+        r#"
+        SELECT
+            s.id                                    AS subscription_id,
+            s.member_id,
+            COALESCE(s.scheduled_plan, s.plan)      AS plan,
+            s.billing_cycle,
+            COALESCE(s.scheduled_amount, s.amount)  AS amount,
+            s.currency,
+            ''                                      AS utoken,
+            ''                                      AS ctoken,
+            FALSE                                   AS require_cvv,
+            COALESCE(s.user_phone, '')              AS user_phone,
+            COALESCE(s.user_email, cu.email, '')    AS user_email,
+            s.plan                                  AS original_plan,
+            s.metadata
+        FROM paytr_subscriptions s
+        JOIN customers cu ON cu.member_id = s.member_id
+        WHERE s.status = 'active'
+          AND s.next_payment_date <= NOW()
+          AND s.utoken IS NULL
+          AND COALESCE((s.metadata->>'free')::boolean, false)
+          AND s.metadata ? 'discount'
+          AND (s.last_renewal_attempt_at IS NULL OR s.last_renewal_attempt_at < NOW() - INTERVAL '1 day')
+        ORDER BY s.next_payment_date
+        "#,
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
 pub async fn query_due(pool: &PgPool, max_failed_attempts: i32) -> Result<Vec<DueSubscription>> {
     let rows = sqlx::query_as::<_, DueSubscription>(
         r#"
@@ -368,6 +402,9 @@ pub async fn mark_expired(pool: &PgPool, grace_days: i32) -> Result<Vec<(i32, i3
                 (s.status = 'cancelled' AND s.expires_at < NOW())
              OR (s.status = 'active'    AND s.expires_at < NOW() - make_interval(days => $1))
              OR (s.status = 'active'    AND s.expires_at < NOW() AND COALESCE((s.metadata->>'trial')::boolean, false))
+             -- Kartsız ödemesiz abonelik: tahsil edilecek kart yok, ek süre beklenmez.
+             OR (s.status = 'active'    AND s.expires_at < NOW() AND s.utoken IS NULL
+                 AND COALESCE((s.metadata->>'free')::boolean, false))
               )
           AND NOT EXISTS (
                 SELECT 1 FROM paytr_payments p
