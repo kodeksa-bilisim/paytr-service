@@ -317,4 +317,98 @@ mod tests {
         assert!(e.contains("<u:Timestamp") && e.contains("<s:Body><X/></s:Body>"));
         assert!(flatten(&e).is_ok());
     }
+
+    /// Uyumsoft TEST ortamına gerçek gönderim (e-Arşiv nihai tüketici + e-Fatura), durum ve PDF.
+    /// Ağ ister; elle: `cargo test -p payment-service uyumsoft_test_env -- --ignored --nocapture`.
+    /// Ortak test hesabı Uyumsoft'un verdiği (kullanıcı/şifre "Uyumsoft", hesap VKN 9000068418; e-Fatura alıcısı 9000500394); `UYUMSOFT_TEST_*` ile değişir.
+    /// e-Arşivde alıcı e-postası verilmez: test ortamı da gerçek adrese posta atabilir.
+    #[tokio::test]
+    #[ignore]
+    async fn uyumsoft_test_env() {
+        use crate::config::{EinvoiceConfig, EinvoiceProvider, Seller};
+        use crate::einvoice::{model::Input, ubl, DocType};
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        let (url, user, pass) = (
+            env("UYUMSOFT_TEST_URL", "https://efatura-test.uyumsoft.com.tr/Services/Integration"),
+            env("UYUMSOFT_TEST_USERNAME", "Uyumsoft"),
+            env("UYUMSOFT_TEST_PASSWORD", "Uyumsoft"),
+        );
+        let seller = Seller {
+            vkn: env("UYUMSOFT_TEST_VKN", "9000068418"),
+            title: "Uyumsoft Bilgi Sistemleri ve Teknolojileri Tic. A.Ş.".into(),
+            tax_office: "Esenler".into(),
+            street: "Uyumsoft".into(),
+            district: "Esenler".into(),
+            city: "İstanbul".into(),
+            postal_zone: None,
+            email: None,
+            phone: None,
+            mersis: None,
+            trade_registry: None,
+        };
+        let cfg = EinvoiceConfig {
+            provider: EinvoiceProvider::Uyumsoft { url: url.clone(), username: user.clone(), password: pass.clone() },
+            start_at: None,
+            shipment_id: "1111111111".into(),
+            shipment_name: "Elektronik teslimat".into(),
+            website: "https://nlink.tr".into(),
+            prefix: None,
+            seller: Some(seller.clone()),
+        };
+        let http = reqwest::Client::new();
+        let c = Client { http: &http, url: &url, username: &user, password: &pass };
+        let (net, vat) = crate::billing::split_vat(29900, 20);
+        let paid = chrono::Utc::now().naive_utc();
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/uyumsoft-test");
+        std::fs::create_dir_all(&out).unwrap();
+
+        // e-Fatura alıcısı: test ortamında kayıtlı bir e-Fatura kullanıcısı gerekir.
+        let mut efatura_vkn = None;
+        for v in ["9000500394", "1234567802"] {
+            let r = c.is_einvoice_user(v).await;
+            println!("IsEInvoiceUser {v}: {r:?}");
+            if efatura_vkn.is_none() && matches!(r, Ok(true)) {
+                efatura_vkn = Some(v);
+            }
+        }
+
+        let individual = serde_json::json!({"type":"individual","name":"Test Alıcı"});
+        let corporate = efatura_vkn.map(|v| serde_json::json!({"type":"corporate","title":"Test Alıcı A.Ş.","tax_number":v,"tax_office":"Şişli",
+            "address":"Test Mah. 2 Sok. No:3","city":"İstanbul","district":"Şişli","country":"Türkiye"}));
+        let mut cases = vec![("earsiv", DocType::Earchive, &individual)];
+        if let Some(b) = corporate.as_ref() {
+            cases.push(("efatura", DocType::Efatura, b));
+        }
+        for (name, doc, buyer) in cases {
+            // ETTN: UUID biçiminde, her koşuda farklı (canlıda veritabanı üretir)
+            let h: String = <sha2::Sha256 as sha2::Digest>::digest(format!("{name}{:?}", std::time::SystemTime::now()))
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let ettn = format!("{}-{}-4{}-a{}-{}", &h[..8], &h[8..12], &h[13..16], &h[17..20], &h[20..32]);
+            let oid = format!("test{}", &ettn[..8]);
+            let input = Input { merchant_oid: &oid, ettn: &ettn, doc, alias: None, buyer, line_name: "nlink Gold plan aboneliği (aylık) — TEST",
+                vat_rate: 20, net_kurus: net, vat_kurus: vat, paid_at: paid };
+            let sent = c.send(&ubl::invoice_info(&input, &cfg, &seller)).await;
+            println!("[{name}] ETTN {ettn} gönderim: {sent:?}");
+            let Ok(created) = sent else { continue };
+            assert!(!created.invoice_number.is_empty());
+            for _ in 0..6 {
+                let st = c.status(&ettn).await;
+                println!("[{name}] durum: {st:?}");
+                if matches!(&st, Ok(s) if s.status >= 40) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            match c.pdf(&ettn).await {
+                Ok(pdf) => {
+                    let f = out.join(format!("{name}-{}.pdf", created.invoice_number));
+                    std::fs::write(&f, &pdf).unwrap();
+                    println!("[{name}] PDF {} bayt → {}", pdf.len(), f.display());
+                }
+                Err(e) => println!("[{name}] PDF alınamadı: {e:?}"),
+            }
+        }
+    }
 }
