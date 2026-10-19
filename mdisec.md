@@ -1,10 +1,24 @@
 # MDISec — Güvenlik testi daveti
 
 **Konu:** nlink ödeme ve abonelik altyapısının güvenlik (sızma) testi
-**Hazırlayan:** Ramazan ERTAN (nlink)
+**Hazırlayan:** Ramazan ERTAN (nlink · Kodeksa)
+**İletişim:** bilgi@nlink.tr · [kodeksa.com](https://kodeksa.com)
 **Durum:** Davet — proforma fatura ve KOSGEB onayı bekleniyor
 
 Merhaba MDISec ekibi,
+
+## Proje hakkında
+
+[nlink.tr](https://nlink.tr) canlıda çalışan bir link kısaltma ve yönetim platformu. Öne çıkan özellikleri:
+
+- **Linkler:** Akıllı yönlendirme ve erişim kuralları, paylaşım kartları, tıklama analitiği, biyografi sayfaları.
+- **Abonelik:** PayTR ile ödenen planlar (Standard, Silver, Gold, Enterprise).
+
+Platformun yeni bölümü **Link Evreni**: linklerin gezegen olarak göründüğü 3B bir dünya. Tanıtım sayfası [nlink.tr/tr/evren](https://nlink.tr/tr/evren).
+
+- Üyeler gezegenlere inip yüzeyde gezebiliyor.
+- Aynı gezegendeki oyuncular çok oyunculu odalarda birbirini görüyor; etkinlikler (uzay futbolu, uçan araba yarışı) ve canlı yayın hologramları var.
+- Link Evreni şu an **beta sürecinde**. Erişim başvuru ve onayla veriliyor; karşılama sayfasından başvurulur, yönetici onaylar. Test ekibine beta erişimli test hesapları açılabilir.
 
 nlink'in ödeme ve abonelik altyapısını bağımsız bir güvenlik testinden geçirmek istiyoruz. Testin KOSGEB desteğiyle yapılmasını planlıyoruz.
 
@@ -32,7 +46,13 @@ Bu depo **paytr-service** projesidir: nlink'in abonelik ve ödeme servisi. Ödem
 - **Yetki ve veri:** Yetki aşımı (başka üyenin aboneliğine ya da ödeme kaydına erişim), girdi doğrulama, iş mantığı açıkları (tutar ya da plan değiştirme).
 - **Bilgi sızıntısı:** Hata mesajları, kayıtlar (log) ve yanıtlarda gizli bilgi açığa çıkıyor mu.
 
-Gerekirse kapsam, nlink web uygulaması ve API'sinin ödemeyle ilgili bölümlerine (plan sayfaları, hesap ve abonelik yönetimi) genişletilebilir. Bunu teklif aşamasında birlikte belirleyebiliriz.
+Gerekirse kapsam şu bölümlere genişletilebilir:
+
+- nlink web uygulaması ve API'sinin ödemeyle ilgili kısımları: plan sayfaları, hesap ve abonelik yönetimi.
+- Link Evreni'nin beta erişim ve başvuru akışı.
+- Link Evreni'nin çok oyunculu oda (WebSocket) ve canlı yayın uçları.
+
+Kapsamı teklif aşamasında birlikte belirleyebiliriz.
 
 ## Test ortamı ve kurallar
 
@@ -50,8 +70,11 @@ Gerekirse kapsam, nlink web uygulaması ve API'sinin ödemeyle ilgili bölümler
 
 ## İletişim
 
-**Ramazan ERTAN** — nlink
+**Ramazan ERTAN** — nlink · Kodeksa
 
-İletişim bilgileri ve test ortamı erişimleri başlangıç toplantısında paylaşılacaktır.
+- E-posta: bilgi@nlink.tr
+- Web: [kodeksa.com](https://kodeksa.com) · [nlink.tr](https://nlink.tr)
+
+Test ortamı erişimleri başlangıç toplantısında güvenli bir kanaldan paylaşılacaktır.
 
 Davetimizi değerlendirdiğiniz için teşekkür ederiz. Teklifinizi ve proforma faturanızı bekliyoruz.
