@@ -169,7 +169,7 @@ mod tests {
             doc,
             alias,
             buyer,
-            line_name: "nlink Gold plan aboneliği (aylık)",
+            line_name: "nlink Altın plan aboneliği (aylık)",
             vat_rate: 20,
             net_kurus: net,
             vat_kurus: vat,

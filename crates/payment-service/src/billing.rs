@@ -238,21 +238,21 @@ mod tests {
     #[test]
     fn descriptions() {
         let s = InvoiceSubject::Period { plan: "gold", billing_cycle: "monthly", start: dt("2026-11-01 01:13:12"), end: dt("2026-12-01 01:13:12") };
-        assert_eq!(line_description(&s), "nlink Gold plan aboneliği (aylık) — 01.11.2026 – 01.12.2026");
+        assert_eq!(line_description(&s), "nlink Altın plan aboneliği (aylık) — 01.11.2026 – 01.12.2026");
         // 22:30 UTC = ertesi gün 01:30 TR
         let s = InvoiceSubject::Period { plan: "silver", billing_cycle: "yearly", start: dt("2026-10-02 22:30:00"), end: dt("2027-10-02 22:30:00") };
-        assert_eq!(line_description(&s), "nlink Silver plan aboneliği (yıllık) — 03.10.2026 – 03.10.2027");
+        assert_eq!(line_description(&s), "nlink Gümüş plan aboneliği (yıllık) — 03.10.2026 – 03.10.2027");
         assert_eq!(
             line_description(&InvoiceSubject::Upgrade { plan: "gold", billing_cycle: "monthly" }),
-            "nlink Gold plan yükseltmesi (aylık) — fark ücreti"
+            "nlink Altın plan yükseltmesi (aylık) — fark ücreti"
         );
         assert_eq!(
             line_description(&InvoiceSubject::Untimed { plan: "gold", billing_cycle: "monthly", renewal: true }),
-            "nlink Gold plan aboneliği (aylık) — yenileme"
+            "nlink Altın plan aboneliği (aylık) — yenileme"
         );
         assert_eq!(
             line_description(&InvoiceSubject::Untimed { plan: "silver", billing_cycle: "yearly", renewal: false }),
-            "nlink Silver plan aboneliği (yıllık)"
+            "nlink Gümüş plan aboneliği (yıllık)"
         );
     }
 

@@ -387,7 +387,7 @@ mod tests {
                 .collect();
             let ettn = format!("{}-{}-4{}-a{}-{}", &h[..8], &h[8..12], &h[13..16], &h[17..20], &h[20..32]);
             let oid = format!("test{}", &ettn[..8]);
-            let input = Input { merchant_oid: &oid, ettn: &ettn, doc, alias: None, buyer, line_name: "nlink Gold plan aboneliği (aylık) — TEST",
+            let input = Input { merchant_oid: &oid, ettn: &ettn, doc, alias: None, buyer, line_name: "nlink Altın plan aboneliği (aylık) — TEST",
                 vat_rate: 20, net_kurus: net, vat_kurus: vat, paid_at: paid };
             let sent = c.send(&ubl::invoice_info(&input, &cfg, &seller)).await;
             println!("[{name}] ETTN {ettn} gönderim: {sent:?}");

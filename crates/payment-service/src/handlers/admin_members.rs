@@ -260,7 +260,7 @@ pub async fn set_plan(
             }
             if subscription_repo::find_live(&state.db, member_id).await?.is_some() {
                 return Err(bad(
-                    "Üyenin aktif ücretli aboneliği var; plan atanamaz. Enterprise sınırları için 'Sınırlar'ı kullanın.",
+                    "Üyenin aktif ücretli aboneliği var; plan atanamaz. Kurumsal sınırları için 'Sınırlar'ı kullanın.",
                 ));
             }
             end_free_access(&mut tx, member_id).await?;
@@ -300,7 +300,7 @@ pub async fn set_plan(
         }
         "limits" => {
             if before["user_type"] != json!("Enterprise") {
-                return Err(bad("Sınırlar yalnızca Enterprise üyelerde değiştirilebilir"));
+                return Err(bad("Sınırlar yalnızca Kurumsal üyelerde değiştirilebilir"));
             }
             if users.is_none() && links.is_none() && clicks.is_none() {
                 return Err(bad("En az bir sınır girin"));

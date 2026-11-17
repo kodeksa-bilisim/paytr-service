@@ -790,9 +790,9 @@ async fn charge(state: &AppState, sub: &DueSubscription) -> Result<(), ChargeErr
 /// PayTR sepet formatı: JSON.stringify([["Plan Adı", "Fiyat", 1]]); fiyat TL ("149.00").
 fn build_basket(plan: &str, amount_kurus: i64) -> String {
     let label = match plan {
-        "gold"       => "Gold Plan Aboneliği",
-        "silver"     => "Silver Plan Aboneliği",
-        "enterprise" => "Enterprise Plan Aboneliği",
+        "gold"       => "Altın Plan Aboneliği",
+        "silver"     => "Gümüş Plan Aboneliği",
+        "enterprise" => "Kurumsal Plan Aboneliği",
         other        => other,
     };
     serde_json::json!([[label, format_tl(amount_kurus), 1]]).to_string()
@@ -811,7 +811,7 @@ mod tests {
 
     #[test]
     fn basket_price_is_tl_amount() {
-        assert_eq!(build_basket("gold", 29_900), r#"[["Gold Plan Aboneliği","299.00",1]]"#);
-        assert_eq!(build_basket("enterprise", 10_109_900), r#"[["Enterprise Plan Aboneliği","101099.00",1]]"#);
+        assert_eq!(build_basket("gold", 29_900), r#"[["Altın Plan Aboneliği","299.00",1]]"#);
+        assert_eq!(build_basket("enterprise", 10_109_900), r#"[["Kurumsal Plan Aboneliği","101099.00",1]]"#);
     }
 }

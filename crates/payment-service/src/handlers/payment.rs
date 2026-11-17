@@ -409,7 +409,7 @@ pub async fn init_enterprise_payment(
     let free = adj.final_kurus == 0;
 
     let basket_label = format!(
-        "Enterprise Plan{} ({} kullanıcı, {}k link/ay, {}k tıklama/ay)",
+        "Kurumsal Plan{} ({} kullanıcı, {}k link/ay, {}k tıklama/ay)",
         if req.billing_cycle == "yearly" { " - Yıllık" } else { "" },
         req.users,
         10 + req.extra_links,
@@ -503,7 +503,7 @@ pub async fn init_enterprise_payment(
         merchant_oid = %req.merchant_oid,
         amount = %charge_amount,
         credit = %format_tl(charge.credit_kurus),
-        "Enterprise ödeme başlatıldı"
+        "Kurumsal ödeme başlatıldı"
     );
 
     Ok((
@@ -701,9 +701,9 @@ mod tests {
         assert_eq!(m["upgrade_from"], 7);
         assert_eq!(m["credit_amount"], "174.50");
         let adj = crate::growth::Adjusted { discount: None, discount_kurus: 0, credit_used_kurus: 0, final_kurus: c.charge_kurus };
-        let basket = adjusted_basket("Gold Plan", &c, &adj);
+        let basket = adjusted_basket("Altın Plan", &c, &adj);
         assert_eq!(basket[0].price, "724.50");
-        assert_eq!(basket[0].name, "Gold Plan (yükseltme, kalan süre düşüldü)");
+        assert_eq!(basket[0].name, "Altın Plan (yükseltme, kalan süre düşüldü)");
         let fresh = Charge { list_kurus: 89_900, credit_kurus: 0, charge_kurus: 89_900, from: None };
         assert!(fresh.metadata().is_none());
     }

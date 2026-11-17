@@ -253,11 +253,12 @@ pub fn format_date_tr(utc: chrono::NaiveDateTime) -> String {
     (utc + chrono::Duration::hours(3)).format("%d.%m.%Y").to_string()
 }
 
+/// Plan adının Türkçesi (e-posta, fatura satırı, PayTR sepeti; 17 Kasım: Gümüş/Altın/Kurumsal).
 pub fn plan_label(plan: &str) -> String {
     match plan {
-        "silver" => "Silver".to_string(),
-        "gold" => "Gold".to_string(),
-        "enterprise" => "Enterprise".to_string(),
+        "silver" => "Gümüş".to_string(),
+        "gold" => "Altın".to_string(),
+        "enterprise" => "Kurumsal".to_string(),
         other => {
             let mut c = other.chars();
             c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
