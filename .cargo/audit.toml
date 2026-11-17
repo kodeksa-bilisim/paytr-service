@@ -1,0 +1,16 @@
+# cargo audit ayarı. CI yalnız YENİ açıklarda düşer.
+# Buradaki her kayıt incelenip kabul edildi: qurlbackend docs/guvenlik/tarama-2026-11-17.md B8.
+# Yeni kayıt eklemeden önce o rapora gerekçesini yaz; sürüm yükseltince kaydı sil.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0194", # quick-xml 0.37: yalnız Uyumsoft yanıtı okunuyor
+    "RUSTSEC-2026-0195", # quick-xml 0.37: yalnız Uyumsoft yanıtı okunuyor
+    "RUSTSEC-2026-0459", # libsqlite3-sys: yalnız Cargo.lock'ta, derlenmiyor (cargo tree -i boş)
+    "RUSTSEC-2023-0071", # rsa: yalnız Cargo.lock'ta, derlenmiyor (cargo tree -i boş)
+    "RUSTSEC-2026-0367", # zip 2.6: extract kullanılmıyor, yalnız bellekte okuma
+    "RUSTSEC-2026-0368", # zip 2.6: extract kullanılmıyor
+    "RUSTSEC-2026-0369", # zip 2.6: extract kullanılmıyor
+    "RUSTSEC-2026-0429", # zip 2.6: extract kullanılmıyor
+    "RUSTSEC-2026-0545", # zip 2.6: aes özelliği kapalı (default-features = false)
+    "RUSTSEC-2026-0548", # zip 2.6: ZipStreamReader kullanılmıyor
+]
